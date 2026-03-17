@@ -92,7 +92,7 @@ def replaced_zones():
 df_plants["Zone"] = replaced_zones()
 
 # Here I can adjust line capacities to tighten/lighten the grid
-df_branch["Pmax"] = 0.85 * df_branch["Pmax"]
+df_branch["Pmax"] = 0.6 * df_branch["Pmax"]
 # df_branch["Pmax"] = 0.85 * df_branch["Pmax"]
 df_bus["ZoneRes"] = df_bus["Zone"]
 

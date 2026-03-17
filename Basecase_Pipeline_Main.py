@@ -34,7 +34,7 @@ from Basecase_Dynamic_GSK_Definition_pipeline import (
 ###############################################################################
 #scopf runs for 85% of line capacities
 #no scopf runs at 60%
-RUN_NAME = "results/pipeline_run_gurobi_SCOPF_dynamic_headroom"
+RUN_NAME = "results/pipeline_run_gurobi_pmax_sub"
 RESULTS_ROOT = Path("results") / RUN_NAME
 
 N_WORKERS = 10
@@ -42,7 +42,7 @@ GUROBI_THREADS_PER_WORKER = 1
 
 # Choose one:
 # "flat", "flat_unit", "pmax", "pmax_sub", "dynamic_headroom", "dynamic_gen"
-GSK_STRATEGY = "dynamic_headroom"
+GSK_STRATEGY = "pmax_sub"
 
 INCLUDE_CB_LINES = True
 CNE_ALPHA = cne_alpha
@@ -337,9 +337,9 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
                 cost_curt=COST_CURT,
                 frm=float(frm),
                 max_ntc=MAX_NTC,
-                preventive=True,   # REMEMBER TO CHANGE FOR SCOPF
-                LODF=LODF,
-                bad_k=bad_k,
+                preventive=False,   # REMEMBER TO CHANGE FOR SCOPF
+                LODF=None,
+                bad_k=None,
             )
 
         problem = cp.Problem(objective, constraints)
