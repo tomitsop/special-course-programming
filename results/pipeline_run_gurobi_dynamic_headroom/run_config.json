@@ -1,0 +1,16 @@
+{
+  "run_name": "pipeline_run_gurobi_dynamic_headroom",
+  "n_workers": 10,
+  "gurobi_threads_per_worker": 1,
+  "gsk_strategy": "dynamic_headroom",
+  "include_cb_lines": true,
+  "cne_alpha": 0.05,
+  "cost_curt": 130,
+  "cost_curt_mc": 0.0,
+  "max_ntc": 1000.0,
+  "export_eps": 1e-07,
+  "time_start": null,
+  "time_end": null,
+  "continue_on_error": true,
+  "frm": 0.05
+}

@@ -1,0 +1,29 @@
+FBME CORRELATION REPORT
+Strategy: NO_SCOPF_50%_pmax_sub
+================================================================================
+
+SUMMARY METRICS
+--------------------------------------------------------------------------------
+Number of MTUs: 8606
+Mean absolute FBME: 29.520107
+Mean hourly overload count: 7.775744
+Mean hourly overload MW: 268.784445
+Mean total demand: 41163.317960
+Mean total renewables: 8602.188877
+Mean renewable share: 0.209906
+Mean sum_abs_np_diff: 562.350546
+Mean max line loading: 1.176535
+
+TOP CORRELATION DRIVERS
+--------------------------------------------------------------------------------
+             variable  pearson_corr  spearman_corr  abs_pearson_corr  abs_spearman_corr  n_obs
+     max_line_loading      0.842009       0.910044          0.842009           0.910044   8606
+hourly_d1_overload_mw      0.745245       0.908107          0.745245           0.908107   8606
+  hourly_d1_overloads      0.800484       0.860732          0.800484           0.860732   8606
+         d0_objective      0.726989       0.855166          0.726989           0.855166   8606
+    mean_line_loading      0.791764       0.809466          0.791764           0.809466   8606
+      sum_abs_np_diff      0.650185       0.688132          0.650185           0.688132   8606
+     total_renewables      0.631271       0.610838          0.631271           0.610838   8606
+         total_demand      0.469898       0.565516          0.469898           0.565516   8606
+      renewable_share      0.514224       0.494301          0.514224           0.494301   8606
+     d1_cgm_objective      0.077602       0.179428          0.077602           0.179428   8606

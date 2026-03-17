@@ -1,0 +1,6 @@
+EPS_MW=1.0
+Attempted=2160
+Feasible=2156
+Infeasible=4
+Infeasible_timesteps:
+2219,2622,3597,4123

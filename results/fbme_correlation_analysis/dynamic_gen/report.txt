@@ -1,0 +1,35 @@
+FBME CORRELATION REPORT
+Strategy: dynamic_gen
+================================================================================
+
+SUMMARY METRICS
+--------------------------------------------------------------------------------
+Number of MTUs (all common solved hours): 8760
+Number of MTUs with valid FBME: 8760
+Mean absolute FBME: 18.078715
+Mean hourly overload count: 2.326256
+Mean hourly overload MW: 64.691413
+Mean total demand: 41263.224403
+Mean total renewables: 8515.902025
+Mean renewable share: 0.207658
+Mean sum_abs_np_diff: 544.476090
+Mean max line loading: 1.032578
+
+FBME INVALID-HOUR REASONS
+--------------------------------------------------------------------------------
+reason
+ok    8760
+
+TOP CORRELATION DRIVERS
+--------------------------------------------------------------------------------
+             variable  pearson_corr  spearman_corr  abs_pearson_corr  abs_spearman_corr  n_obs
+hourly_d1_overload_mw      0.603543       0.883876          0.603543           0.883876   8760
+      sum_abs_np_diff      0.826628       0.880970          0.826628           0.880970   8760
+  hourly_d1_overloads      0.678718       0.862485          0.678718           0.862485   8760
+         d0_objective      0.751305       0.814865          0.751305           0.814865   8760
+     max_line_loading      0.754519       0.812318          0.754519           0.812318   8760
+    mean_line_loading      0.586246       0.701466          0.586246           0.701466   8760
+         total_demand      0.487686       0.541206          0.487686           0.541206   8760
+     total_renewables      0.396114       0.518608          0.396114           0.518608   8760
+      renewable_share      0.264420       0.390003          0.264420           0.390003   8760
+     d1_cgm_objective      0.219665       0.229626          0.219665           0.229626   8760
