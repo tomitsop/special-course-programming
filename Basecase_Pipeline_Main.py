@@ -34,10 +34,6 @@ from Basecase_Dynamic_GSK_Definition_pipeline import (
 ###############################################################################
 # CONFIG
 ###############################################################################
-# NOTE:
-# RUN_NAME should be just a folder name under "results"
-RUN_NAME = "pipeline_run_gurobi_pmax_sub_n1"
-RESULTS_ROOT = Path("results") / RUN_NAME
 
 N_WORKERS = 10
 GUROBI_THREADS_PER_WORKER = 1
@@ -56,7 +52,43 @@ FBMC_MODE = "n1"
 INCLUDE_BASECASE_IN_N1 = True
 
 INCLUDE_CB_LINES = True
+FRM_VALUE = float(frm)
 CNE_ALPHA = float(cne_alpha)
+
+# Sensitivity-study organization:
+#   "GSK"  -> vary GSK strategy, keep FRM and CNE alpha at reference values
+#   "FRM"  -> vary FRM, keep GSK and CNE alpha at reference values
+#   "CNE"  -> vary CNE alpha, keep GSK and FRM at reference values
+#   "MISC" -> fallback custom organization
+STUDY_DIMENSION = "GSK"
+
+# Reference values used in parent-folder naming
+REFERENCE_GSK = "pmax_sub"
+REFERENCE_FRM = 0.05
+REFERENCE_CNE_ALPHA = 0.05
+
+
+def fmt_float(x):
+    return str(float(x)).replace(".", "p")
+
+
+if STUDY_DIMENSION == "GSK":
+    RUN_NAME = f"pipeline_GSK_frm-{fmt_float(REFERENCE_FRM)}_alpha-{fmt_float(REFERENCE_CNE_ALPHA)}"
+    RESULTS_ROOT = Path("results") / RUN_NAME / GSK_STRATEGY
+
+elif STUDY_DIMENSION == "FRM":
+    RUN_NAME = f"pipeline_FRM_gsk-{REFERENCE_GSK}_alpha-{fmt_float(REFERENCE_CNE_ALPHA)}"
+    RESULTS_ROOT = Path("results") / RUN_NAME / f"frm-{fmt_float(FRM_VALUE)}"
+
+elif STUDY_DIMENSION == "CNE":
+    RUN_NAME = f"pipeline_CNE_gsk-{REFERENCE_GSK}_frm-{fmt_float(REFERENCE_FRM)}"
+    RESULTS_ROOT = Path("results") / RUN_NAME / f"alpha-{fmt_float(CNE_ALPHA)}"
+
+else:
+    RUN_NAME = "pipeline_misc"
+    RESULTS_ROOT = Path("results") / RUN_NAME / (
+        f"gsk-{GSK_STRATEGY}_frm-{fmt_float(FRM_VALUE)}_alpha-{fmt_float(CNE_ALPHA)}"
+    )
 
 # Optional time selection
 TIME_START = None   # e.g. 1
@@ -135,7 +167,7 @@ def compute_ram_from_d2_numpy(line_f_d2_cnec: np.ndarray, line_cap_cnec: np.ndar
         RAM_pos = base - line_f_d2_cnec
         RAM_neg = -base - line_f_d2_cnec
     """
-    base = line_cap_cnec * (1.0 - float(frm))
+    base = line_cap_cnec * (1.0 - FRM_VALUE)
     ram_pos = base - line_f_d2_cnec
     ram_neg = -base - line_f_d2_cnec
     return ram_pos.astype(np.float64), ram_neg.astype(np.float64)
@@ -482,7 +514,7 @@ def solve_single_mtu(t: int):
         d1_mc["parameters"]["ram_pos"].value = ram_pos
         d1_mc["parameters"]["ram_neg"].value = ram_neg
 
-        d1_mc["problem"].solve(solver=cp.GUROBI, **gurobi_opts)
+        d1_mc["problem"].solve(solver=cp.GUROBI, ignore_dpp=True, **gurobi_opts)
         obj_d1_mc = d1_mc["problem"].value
 
         if d1_mc["problem"].status not in {"optimal", "optimal_inaccurate"}:
@@ -912,7 +944,7 @@ def main():
         "time_start": TIME_START,
         "time_end": TIME_END,
         "continue_on_error": CONTINUE_ON_ERROR,
-        "frm": float(frm),
+        "frm": FRM_VALUE,
     }
 
     with open(RESULTS_ROOT / "run_config.json", "w") as f:
