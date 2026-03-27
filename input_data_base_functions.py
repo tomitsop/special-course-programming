@@ -62,17 +62,17 @@ Z_not_in_FBMC = Z[len(Z) - 3:]
 N_FBMC = df_bus.loc[df_bus["Zone"].isin(Z_FBMC), "BusID"].tolist()
 N_not_in_FBMC = df_bus.loc[~df_bus["Zone"].isin(Z_FBMC), "BusID"].tolist()
 
-print("Printing Sets and lists")
-print("T (time steps):", T[:10])
-print("R (renewables):", R)
-print("P (non-renewable plants):", P[:10])
-print("N (bus IDs):", N[:10])
-print("L (branch IDs):", L[:10])
-print("Z (zones):", Z)
-print("Z_FBMC:", Z_FBMC)
-print("Z_not_in_FBMC:", Z_not_in_FBMC)
-print("N_FBMC (nodes in Z_FBMC):", N_FBMC[:10])
-print("N_not_in_FBMC (nodes not in Z_FBMC):", N_not_in_FBMC[:10])
+# print("Printing Sets and lists")
+# print("T (time steps):", T[:10])
+# print("R (renewables):", R)
+# print("P (non-renewable plants):", P[:10])
+# print("N (bus IDs):", N[:10])
+# print("L (branch IDs):", L[:10])
+# print("Z (zones):", Z)
+# print("Z_FBMC:", Z_FBMC)
+# print("Z_not_in_FBMC:", Z_not_in_FBMC)
+# print("N_FBMC (nodes in Z_FBMC):", N_FBMC[:10])
+# print("N_not_in_FBMC (nodes not in Z_FBMC):", N_not_in_FBMC[:10])
 
 
 ###########################################
@@ -108,7 +108,7 @@ P_RD = df_plants.loc[
     "GenID"
 ].tolist()
 
-print("P_RD (redispatchable plants):", P_RD[:10])
+# print("P_RD (redispatchable plants):", P_RD[:10])
 
 
 #########################################
@@ -155,11 +155,11 @@ z_to_z = {
     for z in Z
 }
 
-print("n_in_z:", {k: v[:5] for k, v in n_in_z.items()})
-print("p_at_n:", {k: v[:5] for k, v in p_at_n.items()})
-print("p_rd_at_n:", {k: v[:5] for k, v in p_rd_at_n.items()})
-print("p_in_z:", {k: v[:5] for k, v in p_in_z.items()})
-print("z_to_z:", {k: v for k, v in z_to_z.items()})
+# print("n_in_z:", {k: v[:5] for k, v in n_in_z.items()})
+# print("p_at_n:", {k: v[:5] for k, v in p_at_n.items()})
+# print("p_rd_at_n:", {k: v[:5] for k, v in p_rd_at_n.items()})
+# print("p_in_z:", {k: v[:5] for k, v in p_in_z.items()})
+# print("z_to_z:", {k: v for k, v in z_to_z.items()})
 
 
 #########################################
@@ -179,7 +179,7 @@ Z_fb_idx = {z: i for i, z in enumerate(Z_FBMC)}
 # Non-FBMC Zones indexing
 Z_not_idx = {z: i for i, z in enumerate(Z_not_in_FBMC)}
 
-print(N_idx)
+# print(N_idx)
 
 # Mappings in index-space
 plants_at_node_idx = {
@@ -292,7 +292,7 @@ def find_cross_border_lines():
     return cb_lines_temp
 
 cross_border_lines = find_cross_border_lines()
-print("Cross-border lines:", cross_border_lines)
+# print("Cross-border lines:", cross_border_lines)
 
 
 #########################################
@@ -470,11 +470,11 @@ def get_gsk_pmax_sub():
 
 gsk_pmax_sub = get_gsk_pmax_sub()
 
-print("All GSKs built, with column sums:")
-print("1) GSK flat:",       np.round(np.sum(gsk_flat, axis=0), 2))
-print("2) GSK flat unit:",  np.round(np.sum(gsk_flat_unit, axis=0), 2))
-print("3) GSK pmax:",       np.round(np.sum(gsk_pmax, axis=0), 2))
-print("4) GSK pmax sub:",   np.round(np.sum(gsk_pmax_sub, axis=0), 2))
+# print("All GSKs built, with column sums:")
+# print("1) GSK flat:",       np.round(np.sum(gsk_flat, axis=0), 2))
+# print("2) GSK flat unit:",  np.round(np.sum(gsk_flat_unit, axis=0), 2))
+# print("3) GSK pmax:",       np.round(np.sum(gsk_pmax, axis=0), 2))
+# print("4) GSK pmax sub:",   np.round(np.sum(gsk_pmax_sub, axis=0), 2))
 
 
 ###########################
@@ -521,5 +521,5 @@ CNEC_indices = [L_idx[l] for l in CNEC]
 PTDF_CNEC = PTDF_FBMC[CNEC_indices, :]   # (|CNEC|, |N_FBMC|)
 PTDF_Z_CNEC = PTDF_Z[CNEC_indices, :]    # (|CNEC|, |Z_FBMC|)
 
-print(f"CNE selection: {len(CNEC)} CNEs selected at alpha={cne_alpha}")
-print("Critical Network Elements and Contingencies (CNEC):", CNEC)
+# print(f"CNE selection: {len(CNEC)} CNEs selected at alpha={cne_alpha}")
+# print("Critical Network Elements and Contingencies (CNEC):", CNEC)
