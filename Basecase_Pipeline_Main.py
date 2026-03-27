@@ -717,7 +717,7 @@ def solve_single_mtu(t: int):
         objective, constraints, params_list, vars_list, _, params, vars_ = \
             build_d2_cgm_problem_components(
                 cost_curt=COST_CURT,
-                frm=float(frm),
+                frm=FRM_VALUE,
                 max_ntc=MAX_NTC,
                 preventive=False,
                 LODF=None,
