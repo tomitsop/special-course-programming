@@ -13,28 +13,30 @@ import cvxpy as cp
 from input_data_base_functions import *
 
 # D-2
-from Differentiable_D_2_SCOPF_CGM import build_d2_cgm_problem_components,compute_lodf_from_ptdf
+from Differentiable_D_2_SCOPF_CGM import (
+    build_d2_cgm_problem_components,
+    compute_lodf_from_ptdf,
+)
+
 # D-1 CGM
 from Differentiable_D_1_CGM import build_d1_cgm_problem_components
 
 # D-0 CM
 from D_0_Congestion_Management import build_d0_redispatch_problem_components
 
-# GSK utilities (refactored module)
+# GSK utilities (updated contingency-aware module)
 from Basecase_Dynamic_GSK_Definition_pipeline import (
     GSKStrategyManager,
-    build_dynamic_headroom_gsk,
-    build_dynamic_gen_gsk,
-    compute_cnec_from_gsk,
+    compute_selected_post_contingency_line_flows,
 )
 
 
 ###############################################################################
 # CONFIG
 ###############################################################################
-#scopf runs for 85% of line capacities
-#no scopf runs at 60%
-RUN_NAME = "results/pipeline_run_gurobi_pmax_sub"
+# NOTE:
+# RUN_NAME should be just a folder name under "results"
+RUN_NAME = "pipeline_run_gurobi_pmax_sub_n1"
 RESULTS_ROOT = Path("results") / RUN_NAME
 
 N_WORKERS = 10
@@ -44,8 +46,17 @@ GUROBI_THREADS_PER_WORKER = 1
 # "flat", "flat_unit", "pmax", "pmax_sub", "dynamic_headroom", "dynamic_gen"
 GSK_STRATEGY = "pmax_sub"
 
+# FBMC mode:
+#   "basecase" -> old behavior
+#   "n1"       -> contingency-aware PTDF_Z / CNEC workflow
+FBMC_MODE = "n1"
+
+# If FBMC_MODE == "n1":
+# include the N-0 selected block before the N-1 rows
+INCLUDE_BASECASE_IN_N1 = True
+
 INCLUDE_CB_LINES = True
-CNE_ALPHA = cne_alpha
+CNE_ALPHA = float(cne_alpha)
 
 # Optional time selection
 TIME_START = None   # e.g. 1
@@ -61,8 +72,12 @@ EXPORT_EPS = 1e-7
 CONTINUE_ON_ERROR = True
 
 
-LODF = None
-bad_k = None
+###############################################################################
+# GLOBALS FOR WORKERS
+###############################################################################
+GLOBAL_LODF = None
+GLOBAL_BAD_K = None
+
 
 ###############################################################################
 # HELPERS
@@ -75,8 +90,7 @@ def ensure_dir(path: Path):
 def build_time_index():
     """
     Uses the same logic you previously had: time points from X / predictions,
-    but only to define the MTU universe. If you have a cleaner source of MTUs,
-    replace this function.
+    but only to define the MTU universe.
     """
     X = pd.read_csv("data/X.csv", index_col=0)
     if X.index.min() == 0:
@@ -116,7 +130,7 @@ def build_gmax_rd_np():
 
 def compute_ram_from_d2_numpy(line_f_d2_cnec: np.ndarray, line_cap_cnec: np.ndarray):
     """
-    Same formula you showed before:
+    RAM formula:
         base    = line_cap_cnec * (1 - frm)
         RAM_pos = base - line_f_d2_cnec
         RAM_neg = -base - line_f_d2_cnec
@@ -131,23 +145,70 @@ def export_pairs_builder():
     return [(z, zz) for z in Z for zz in z_to_z[z]]
 
 
+def build_line_f_d2_for_fb_rows(
+    *,
+    line_f_d2: np.ndarray,
+    cnec_idx_t,
+    contingency_idx_t,
+    lodf: np.ndarray,
+) -> np.ndarray:
+    """
+    Build the D-2 reference flow aligned with each FB constraint row.
+
+    basecase row (contingency_idx == -1):
+        use line_f_d2[cnec_idx]
+
+    N-1 row (contingency_idx == k):
+        use post-contingency monitored-line flow
+    """
+    line_f_d2 = np.asarray(line_f_d2, dtype=np.float64).reshape(-1)
+    cnec_idx_arr = np.asarray(cnec_idx_t, dtype=np.int64).reshape(-1)
+    contingency_idx_arr = np.asarray(contingency_idx_t, dtype=np.int64).reshape(-1)
+
+    if cnec_idx_arr.shape[0] != contingency_idx_arr.shape[0]:
+        raise ValueError("cnec_idx_t and contingency_idx_t must have the same length.")
+
+    out = np.zeros(cnec_idx_arr.shape[0], dtype=np.float64)
+
+    # Group by contingency for efficiency
+    unique_k = np.unique(contingency_idx_arr)
+
+    for k in unique_k:
+        mask = contingency_idx_arr == k
+        monitored_idx = cnec_idx_arr[mask].tolist()
+
+        if int(k) == -1:
+            out[mask] = line_f_d2[cnec_idx_arr[mask]]
+        else:
+            out[mask] = compute_selected_post_contingency_line_flows(
+                line_f_base=line_f_d2,
+                lodf=lodf,
+                monitored_idx=monitored_idx,
+                contingency_idx=int(k),
+            )
+
+    return out
+
+
 ###############################################################################
 # RUNTIME D-1 MC BUILDER
-# Same equations as before, but PTDF_Z_CNEC is passed per MTU
 ###############################################################################
 
 def build_d1_mc_problem_components_runtime(
     *,
     ptdf_z_cnec_t: np.ndarray,
-    cnec_t,
+    n_constraints: int,
     cost_curt_mc=0.0,
     max_ntc=1000.0,
     export_eps=1e-7,
 ):
+    """
+    D-1 market coupling model with runtime PTDF_Z_CNEC rows.
+    """
     nP = len(P)
     nN = len(N)
     nZ_fb = len(Z_FBMC)
-    nCNE = len(cnec_t)
+    nCNE = int(n_constraints)
 
     export_pairs = export_pairs_builder()
     export_idx = {pair: i for i, pair in enumerate(export_pairs)}
@@ -269,44 +330,45 @@ def build_d1_mc_problem_components_runtime(
 # GSK / CNEC PER MTU
 ###############################################################################
 
-def build_gsk_payload_for_t(strategy: str, gsk_manager: GSKStrategyManager, gen_d2_np: np.ndarray):
+def build_gsk_payload_for_t(
+    strategy: str,
+    gsk_manager: GSKStrategyManager,
+    gen_d2_np: np.ndarray,
+    lodf: np.ndarray,
+    bad_k: np.ndarray,
+):
     """
-    Static strategies: use manager cache
-    Dynamic strategies: build from this MTU's D-2 generation
-    """
-    if strategy in {"flat", "flat_unit", "pmax", "pmax_sub"}:
-        return gsk_manager.build_for_t(strategy=strategy)
+    Build GSK and FB payload for one MTU.
 
+    Static strategies:
+        manager cache can be used
+
+    Dynamic strategies:
+        GSK depends on gen_d2_np for the MTU
+    """
     gen_d2_series = pd.Series(gen_d2_np, index=P)
 
-    if strategy == "dynamic_headroom":
-        gsk = build_dynamic_headroom_gsk(gen_d2_series)
-    elif strategy == "dynamic_gen":
-        gsk = build_dynamic_gen_gsk(gen_d2_series)
-    else:
-        raise ValueError(f"Unknown GSK strategy: {strategy}")
-
-    cnec, cnec_idx, ptdf_z, ptdf_z_cnec = compute_cnec_from_gsk(
-        gsk=gsk,
-        cne_alpha=CNE_ALPHA,
-        include_cb_lines=INCLUDE_CB_LINES,
+    payload = gsk_manager.build_for_t(
+        strategy=strategy,
+        df_d2_gen=gen_d2_series,
+        lodf=lodf,
+        bad_k=bad_k,
+        fbmc_mode=FBMC_MODE,
+        include_basecase=INCLUDE_BASECASE_IN_N1,
     )
 
-    return {
-        "gsk": gsk,
-        "cnec": cnec,
-        "cnec_idx": cnec_idx,
-        "ptdf_z": ptdf_z,
-        "ptdf_z_cnec": ptdf_z_cnec,
-    }
+    return payload
 
 
 ###############################################################################
 # SINGLE MTU SOLVE
 ###############################################################################
 
-def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
+def solve_single_mtu(t: int):
     try:
+        if GLOBAL_LODF is None or GLOBAL_BAD_K is None:
+            raise RuntimeError("GLOBAL_LODF / GLOBAL_BAD_K not initialized in worker.")
+
         # ---------------------------------------------------------------------
         # Local solver options
         # ---------------------------------------------------------------------
@@ -331,32 +393,28 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
         # ---------------------------------------------------------------------
         # 1) D-2 CGM
         # ---------------------------------------------------------------------
-
         objective, constraints, params_list, vars_list, _, params, vars_ = \
             build_d2_cgm_problem_components(
                 cost_curt=COST_CURT,
                 frm=float(frm),
                 max_ntc=MAX_NTC,
-                preventive=False,   # REMEMBER TO CHANGE FOR SCOPF
+                preventive=False,   # Keep your current setup
                 LODF=None,
                 bad_k=None,
             )
 
         problem = cp.Problem(objective, constraints)
 
-        # set parameters
         params["dem"].value = dem_np
         params["renew"].value = renew_np
         params["line_cap"].value = line_cap_np
 
-        # solve
         problem.solve(solver=cp.GUROBI, **gurobi_opts)
         obj_d2 = problem.value
 
         if problem.status not in {"optimal", "optimal_inaccurate"}:
             raise RuntimeError(f"D-2 infeasible/status={problem.status}")
 
-        # extract variables
         gen_d2 = np.array(vars_["GEN"].value).reshape(-1)
         curt_d2 = np.array(vars_["CURT"].value).reshape(-1)
         np_d2_fb = np.array(vars_["NP"].value).reshape(-1)
@@ -364,7 +422,7 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
         delta_d2 = np.array(vars_["DELTA"].value).reshape(-1)
         nod_inj_d2 = np.array(vars_["NOD_INJ"].value).reshape(-1)
         export_d2 = np.array(vars_["EXPORT"].value).reshape(-1)
-        
+
         # ---------------------------------------------------------------------
         # 2) GSK / CNEC / PTDF_Z_CNEC
         # ---------------------------------------------------------------------
@@ -372,17 +430,34 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
             strategy=GSK_STRATEGY,
             gsk_manager=gsk_manager,
             gen_d2_np=gen_d2,
+            lodf=GLOBAL_LODF,
+            bad_k=GLOBAL_BAD_K,
         )
 
-        gsk_t = gsk_payload["gsk"]
-        cnec_t = gsk_payload["cnec"]
-        cnec_idx_t = gsk_payload["cnec_idx"]
+        gsk_t = np.array(gsk_payload["gsk"], dtype=np.float64)
+        cnec_t = list(gsk_payload["cnec"])
+        cnec_idx_t = np.array(gsk_payload["cnec_idx"], dtype=np.int64)
         ptdf_z_cnec_t = np.array(gsk_payload["ptdf_z_cnec"], dtype=np.float64)
 
+        contingency_t = list(gsk_payload["contingency"]) if "contingency" in gsk_payload else ["basecase"] * len(cnec_t)
+        contingency_idx_t = np.array(
+            gsk_payload["contingency_idx"] if "contingency_idx" in gsk_payload else [-1] * len(cnec_t),
+            dtype=np.int64
+        )
+
+        if ptdf_z_cnec_t.shape[0] != len(cnec_t):
+            raise ValueError("Mismatch between PTDF_Z_CNEC rows and CNEC metadata length.")
+
         # ---------------------------------------------------------------------
-        # 3) RAM from D-2 flows on CNEC
+        # 3) RAM from D-2 flows on selected FB rows
         # ---------------------------------------------------------------------
-        line_f_d2_cnec = line_f_d2[cnec_idx_t]
+        line_f_d2_cnec = build_line_f_d2_for_fb_rows(
+            line_f_d2=line_f_d2,
+            cnec_idx_t=cnec_idx_t,
+            contingency_idx_t=contingency_idx_t,
+            lodf=GLOBAL_LODF,
+        )
+
         line_cap_cnec = line_cap_np[cnec_idx_t]
 
         ram_pos, ram_neg = compute_ram_from_d2_numpy(
@@ -395,7 +470,7 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
         # ---------------------------------------------------------------------
         d1_mc = build_d1_mc_problem_components_runtime(
             ptdf_z_cnec_t=ptdf_z_cnec_t,
-            cnec_t=cnec_t,
+            n_constraints=len(cnec_t),
             cost_curt_mc=COST_CURT_MC,
             max_ntc=MAX_NTC,
             export_eps=EXPORT_EPS,
@@ -418,8 +493,8 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
         np_d1 = np.array(d1_mc["variables"]["NP"].value).reshape(-1)
         export_d1_mc = np.array(d1_mc["variables"]["EXPORT"].value).reshape(-1)
         dual_power_balance_d1_mc = np.array(
-        [d1_mc["duals"]["power_balance"][z].dual_value for z in Z_FBMC],
-        dtype=np.float64
+            [d1_mc["duals"]["power_balance"][z].dual_value for z in Z_FBMC],
+            dtype=np.float64
         )
 
         # ---------------------------------------------------------------------
@@ -492,7 +567,7 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
         return {
             "t": t,
             "status": "ok",
-            
+
             "objectives": {
                 "d2": obj_d2,
                 "d1_mc": obj_d1_mc,
@@ -511,11 +586,15 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
             },
 
             "fb": {
+                "MODE": FBMC_MODE,
                 "GSK": gsk_t,
                 "CNEC": cnec_t,
-                "CNEC_IDX": np.array(cnec_idx_t, dtype=np.int64),
+                "CNEC_IDX": cnec_idx_t,
+                "CONTINGENCY": contingency_t,
+                "CONTINGENCY_IDX": contingency_idx_t,
                 "RAM_POS": ram_pos,
                 "RAM_NEG": ram_neg,
+                "LINE_F_D2_CNEC": line_f_d2_cnec,
                 "PTDF_Z_CNEC": ptdf_z_cnec_t,
             },
 
@@ -562,19 +641,14 @@ def solve_single_mtu(t: int, LODF: np.ndarray, bad_k: np.ndarray):
 # SAVE HELPERS
 ###############################################################################
 
-def series_name_list(prefix, items):
-    return [f"{prefix}__{x}" for x in items]
-
-
 def save_matrix_results(results_ok, stage_dir: Path):
     ensure_dir(stage_dir)
 
-    time_sorted = sorted([r["t"] for r in results_ok])
-    
-    
-    obj_rows = []
+    results_sorted = sorted(results_ok, key=lambda x: x["t"])
+    time_sorted = [r["t"] for r in results_sorted]
 
-    for r in results_ok:
+    obj_rows = []
+    for r in results_sorted:
         obj_rows.append({
             "t": r["t"],
             "d2": r["objectives"]["d2"],
@@ -582,7 +656,6 @@ def save_matrix_results(results_ok, stage_dir: Path):
             "d1_cgm": r["objectives"]["d1_cgm"],
             "d0": r["objectives"]["d0"],
         })
-
     pd.DataFrame(obj_rows).set_index("t").to_parquet(stage_dir / "objectives.parquet")
 
     # ---- D-2 ----
@@ -590,44 +663,42 @@ def save_matrix_results(results_ok, stage_dir: Path):
     ensure_dir(d2_dir)
 
     pd.DataFrame(
-        [r["d2"]["GEN"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["GEN"] for r in results_sorted],
         index=time_sorted, columns=P
     ).to_parquet(d2_dir / "gen.parquet")
 
     pd.DataFrame(
-        [r["d2"]["CURT"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["CURT"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d2_dir / "curt.parquet")
 
     pd.DataFrame(
-        [r["d2"]["NP"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["NP"] for r in results_sorted],
         index=time_sorted, columns=Z_FBMC
     ).to_parquet(d2_dir / "np.parquet")
 
     pd.DataFrame(
-        [r["d2"]["LINE_F"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["LINE_F"] for r in results_sorted],
         index=time_sorted, columns=L
     ).to_parquet(d2_dir / "line_f.parquet")
 
     pd.DataFrame(
-        [r["d2"]["DELTA"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["DELTA"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d2_dir / "delta.parquet")
 
     pd.DataFrame(
-        [r["d2"]["NOD_INJ"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["NOD_INJ"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d2_dir / "nod_inj.parquet")
 
-    # D-2 export columns may depend on your implementation.
-    # If export dimension matches Z_not_in_FBMC, keep these labels.
-    if len(results_ok[0]["d2"]["EXPORT"]) == len(Z_not_in_FBMC):
+    if len(results_sorted[0]["d2"]["EXPORT"]) == len(Z_not_in_FBMC):
         d2_export_cols = Z_not_in_FBMC
     else:
-        d2_export_cols = [f"export_{i}" for i in range(len(results_ok[0]["d2"]["EXPORT"]))]
+        d2_export_cols = [f"export_{i}" for i in range(len(results_sorted[0]["d2"]["EXPORT"]))]
 
     pd.DataFrame(
-        [r["d2"]["EXPORT"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d2"]["EXPORT"] for r in results_sorted],
         index=time_sorted, columns=d2_export_cols
     ).to_parquet(d2_dir / "export.parquet")
 
@@ -645,17 +716,20 @@ def save_matrix_results(results_ok, stage_dir: Path):
     line_cap_df.to_parquet(fb_dir / "line_cap_margin.parquet")
 
     cnec_rows = []
-    for r in sorted(results_ok, key=lambda x: x["t"]):
+    for r in results_sorted:
         cnec_rows.append({
             "t": r["t"],
-            "n_cnec": len(r["fb"]["CNEC"]),
+            "fbmc_mode": r["fb"]["MODE"],
+            "n_rows": len(r["fb"]["CNEC"]),
             "cnec": list(r["fb"]["CNEC"]),
-            "cnec_idx": list(r["fb"]["CNEC_IDX"]),
+            "cnec_idx": list(np.asarray(r["fb"]["CNEC_IDX"], dtype=int)),
+            "contingency": list(r["fb"]["CONTINGENCY"]),
+            "contingency_idx": list(np.asarray(r["fb"]["CONTINGENCY_IDX"], dtype=int)),
         })
     pd.DataFrame(cnec_rows).set_index("t").to_parquet(fb_dir / "cnec_info.parquet")
 
     gsk_long = []
-    for r in sorted(results_ok, key=lambda x: x["t"]):
+    for r in results_sorted:
         gsk = r["fb"]["GSK"]
         for ni, n in enumerate(N_FBMC):
             for zi, z in enumerate(Z_FBMC):
@@ -668,29 +742,36 @@ def save_matrix_results(results_ok, stage_dir: Path):
     pd.DataFrame(gsk_long).to_parquet(fb_dir / "gsk_long.parquet")
 
     ram_rows = []
-    for r in sorted(results_ok, key=lambda x: x["t"]):
-        for k, line_name in enumerate(r["fb"]["CNEC"]):
+    for r in results_sorted:
+        for k in range(len(r["fb"]["CNEC"])):
             ram_rows.append({
                 "t": r["t"],
-                "cnec": line_name,
+                "cnec": r["fb"]["CNEC"][k],
                 "cnec_idx": int(r["fb"]["CNEC_IDX"][k]),
+                "contingency": r["fb"]["CONTINGENCY"][k],
+                "contingency_idx": int(r["fb"]["CONTINGENCY_IDX"][k]),
+                "line_f_d2_cnec": float(r["fb"]["LINE_F_D2_CNEC"][k]),
                 "ram_pos": float(r["fb"]["RAM_POS"][k]),
                 "ram_neg": float(r["fb"]["RAM_NEG"][k]),
             })
     pd.DataFrame(ram_rows).to_parquet(fb_dir / "ram_long.parquet")
 
     ptdf_rows = []
-    for r in sorted(results_ok, key=lambda x: x["t"]):
+    for r in results_sorted:
         mat = r["fb"]["PTDF_Z_CNEC"]
         cnec_names = r["fb"]["CNEC"]
         cnec_idx = r["fb"]["CNEC_IDX"]
+        contingency_names = r["fb"]["CONTINGENCY"]
+        contingency_idx = r["fb"]["CONTINGENCY_IDX"]
 
-        for i, cnec_name in enumerate(cnec_names):
+        for i in range(mat.shape[0]):
             for j, z in enumerate(Z_FBMC):
                 ptdf_rows.append({
                     "t": r["t"],
-                    "cnec": cnec_name,
+                    "cnec": cnec_names[i],
                     "cnec_idx": int(cnec_idx[i]),
+                    "contingency": contingency_names[i],
+                    "contingency_idx": int(contingency_idx[i]),
                     "zone": z,
                     "ptdf": float(mat[i, j]),
                 })
@@ -701,33 +782,32 @@ def save_matrix_results(results_ok, stage_dir: Path):
     d1_mc_dir = stage_dir / "d1_mc"
     ensure_dir(d1_mc_dir)
 
-    export_pairs = results_ok[0]["meta"]["export_pairs"]
+    export_pairs = results_sorted[0]["meta"]["export_pairs"]
     export_cols = [f"{a}__to__{b}" for a, b in export_pairs]
 
     pd.DataFrame(
-        [r["d1_mc"]["GEN"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_mc"]["GEN"] for r in results_sorted],
         index=time_sorted, columns=P
     ).to_parquet(d1_mc_dir / "gen.parquet")
 
     pd.DataFrame(
-        [r["d1_mc"]["CURT"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_mc"]["CURT"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d1_mc_dir / "curt.parquet")
 
     pd.DataFrame(
-        [r["d1_mc"]["NP"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_mc"]["NP"] for r in results_sorted],
         index=time_sorted, columns=Z_FBMC
     ).to_parquet(d1_mc_dir / "np.parquet")
 
     pd.DataFrame(
-        [r["d1_mc"]["EXPORT"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_mc"]["EXPORT"] for r in results_sorted],
         index=time_sorted, columns=export_cols
     ).to_parquet(d1_mc_dir / "export.parquet")
-    
+
     pd.DataFrame(
-        [r["d1_mc"]["DUAL_POWER_BALANCE"] for r in sorted(results_ok, key=lambda x: x["t"])],
-        index=time_sorted,
-        columns=Z_FBMC
+        [r["d1_mc"]["DUAL_POWER_BALANCE"] for r in results_sorted],
+        index=time_sorted, columns=Z_FBMC
     ).to_parquet(d1_mc_dir / "dual_power_balance.parquet")
 
     # ---- D-1 CGM ----
@@ -735,32 +815,32 @@ def save_matrix_results(results_ok, stage_dir: Path):
     ensure_dir(d1_cgm_dir)
 
     pd.DataFrame(
-        [r["d1_cgm"]["DELTA"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_cgm"]["DELTA"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d1_cgm_dir / "delta.parquet")
 
     pd.DataFrame(
-        [r["d1_cgm"]["NOD_INJ"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_cgm"]["NOD_INJ"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d1_cgm_dir / "nod_inj.parquet")
 
     pd.DataFrame(
-        [r["d1_cgm"]["LINE_F"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_cgm"]["LINE_F"] for r in results_sorted],
         index=time_sorted, columns=L
     ).to_parquet(d1_cgm_dir / "line_f.parquet")
 
     pd.DataFrame(
-        [r["d1_cgm"]["NP"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_cgm"]["NP"] for r in results_sorted],
         index=time_sorted, columns=Z_FBMC
     ).to_parquet(d1_cgm_dir / "np.parquet")
 
-    if len(results_ok[0]["d1_cgm"]["EXPORT"]) == len(Z_not_in_FBMC):
+    if len(results_sorted[0]["d1_cgm"]["EXPORT"]) == len(Z_not_in_FBMC):
         d1_cgm_export_cols = Z_not_in_FBMC
     else:
-        d1_cgm_export_cols = [f"export_{i}" for i in range(len(results_ok[0]["d1_cgm"]["EXPORT"]))]
+        d1_cgm_export_cols = [f"export_{i}" for i in range(len(results_sorted[0]["d1_cgm"]["EXPORT"]))]
 
     pd.DataFrame(
-        [r["d1_cgm"]["EXPORT"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d1_cgm"]["EXPORT"] for r in results_sorted],
         index=time_sorted, columns=d1_cgm_export_cols
     ).to_parquet(d1_cgm_dir / "export.parquet")
 
@@ -769,34 +849,44 @@ def save_matrix_results(results_ok, stage_dir: Path):
     ensure_dir(d0_dir)
 
     pd.DataFrame(
-        [r["d0"]["CURT_RD"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d0"]["CURT_RD"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d0_dir / "curt_rd.parquet")
 
     pd.DataFrame(
-        [r["d0"]["RD_POS"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d0"]["RD_POS"] for r in results_sorted],
         index=time_sorted, columns=P_RD
     ).to_parquet(d0_dir / "rd_pos.parquet")
 
     pd.DataFrame(
-        [r["d0"]["RD_NEG"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d0"]["RD_NEG"] for r in results_sorted],
         index=time_sorted, columns=P_RD
     ).to_parquet(d0_dir / "rd_neg.parquet")
 
     pd.DataFrame(
-        [r["d0"]["DELTA"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d0"]["DELTA"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d0_dir / "delta.parquet")
 
     pd.DataFrame(
-        [r["d0"]["NOD_INJ"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d0"]["NOD_INJ"] for r in results_sorted],
         index=time_sorted, columns=N
     ).to_parquet(d0_dir / "nod_inj.parquet")
 
     pd.DataFrame(
-        [r["d0"]["LINE_F"] for r in sorted(results_ok, key=lambda x: x["t"])],
+        [r["d0"]["LINE_F"] for r in results_sorted],
         index=time_sorted, columns=L
     ).to_parquet(d0_dir / "line_f.parquet")
+
+
+###############################################################################
+# WORKER INIT
+###############################################################################
+
+def init_worker(lodf, bad_k):
+    global GLOBAL_LODF, GLOBAL_BAD_K
+    GLOBAL_LODF = np.asarray(lodf, dtype=np.float64)
+    GLOBAL_BAD_K = np.asarray(bad_k, dtype=bool)
 
 
 ###############################################################################
@@ -811,6 +901,8 @@ def main():
         "n_workers": N_WORKERS,
         "gurobi_threads_per_worker": GUROBI_THREADS_PER_WORKER,
         "gsk_strategy": GSK_STRATEGY,
+        "fbmc_mode": FBMC_MODE,
+        "include_basecase_in_n1": INCLUDE_BASECASE_IN_N1,
         "include_cb_lines": INCLUDE_CB_LINES,
         "cne_alpha": CNE_ALPHA,
         "cost_curt": COST_CURT,
@@ -828,22 +920,24 @@ def main():
 
     time_index = build_time_index()
     print(f"Running {len(time_index)} MTUs with {N_WORKERS} workers")
-    
-    global LODF, bad_k
-    
-    LODF, bad_k = compute_lodf_from_ptdf(
-    df_branch=df_branch,
-    PTDF_full=PTDF_full,
-    N_idx=N_idx,
-    L_idx=L_idx,
-    L=L,
+
+    lodf, bad_k = compute_lodf_from_ptdf(
+        df_branch=df_branch,
+        PTDF_full=PTDF_full,
+        N_idx=N_idx,
+        L_idx=L_idx,
+        L=L,
     )
 
     results = []
     failures = []
 
-    with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
-        futures = {executor.submit(solve_single_mtu, t, LODF, bad_k): t for t in time_index}
+    with ProcessPoolExecutor(
+        max_workers=N_WORKERS,
+        initializer=init_worker,
+        initargs=(lodf, bad_k),
+    ) as executor:
+        futures = {executor.submit(solve_single_mtu, t): t for t in time_index}
 
         for fut in as_completed(futures):
             t = futures[fut]
