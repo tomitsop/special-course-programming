@@ -17,7 +17,7 @@ data_path = os.path.join(current_path, 'data')
 # Import data
 df_bus_load = pd.read_csv(os.path.join(data_path, "df_bus_load_added_abroad_final.csv")) # load data for one year
 df_bus_load.index = range(1, len(df_bus_load) + 1)
-print(df_bus_load.head())
+# print(df_bus_load.head())
 df_bus = pd.read_csv(os.path.join(data_path, "df_bus_final.csv")) # bus ID and zone location
 df_branch = pd.read_csv(os.path.join(data_path, "df_branch_final.csv")) # lines and line connections from node to node 
 df_plants = pd.read_csv(os.path.join(data_path, "df_gen_final.csv"), sep=";") # generators id and type, bus location, capacity and marginal costs
@@ -29,7 +29,7 @@ susceptance = pd.read_csv(os.path.join(data_path, "matrix_Bd_final.csv")) # bus 
 # Load Renewable capacity factors
 df_pv = pd.read_excel(os.path.join(data_path, "data_renew_2015.xlsx"), sheet_name="pv", header=0) # solar power factors
 df_pv.columns = df_pv.columns.astype(str)
-print(df_pv.head())
+# print(df_pv.head())
 df_wind = pd.read_excel(os.path.join(data_path, "data_renew_2015.xlsx"), sheet_name="onshore", header=0) # onshore wind power factors
 df_wind.columns = df_wind.columns.astype(str)
 df_wind_off = pd.read_excel(os.path.join(data_path, "data_renew_2015.xlsx"), sheet_name="offshore", header=0) # offshore wind power factors

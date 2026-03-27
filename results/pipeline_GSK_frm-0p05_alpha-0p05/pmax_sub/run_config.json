@@ -7,6 +7,7 @@
   "include_basecase_in_n1": true,
   "include_cb_lines": true,
   "cne_alpha": 0.05,
+  "frm": 0.05,
   "cost_curt": 130,
   "cost_curt_mc": 0.0,
   "max_ntc": 1000.0,
@@ -14,5 +15,9 @@
   "time_start": null,
   "time_end": null,
   "continue_on_error": true,
-  "frm": 0.05
+  "screening_enabled": true,
+  "screening_max_iters": 15,
+  "screening_viol_tol": 1e-06,
+  "screening_bind_tol": 1e-05,
+  "save_only_active_cnecs": true
 }
