@@ -67,6 +67,16 @@ REFERENCE_GSK = "pmax_sub"
 REFERENCE_FRM = 0.05
 REFERENCE_CNE_ALPHA = 0.05
 
+# Screening / row generation
+# Used only when FBMC_MODE == "n1"
+SCREENING_ENABLED = True
+SCREENING_MAX_ITERS = 15
+SCREENING_VIOL_TOL = 1e-6
+SCREENING_BIND_TOL = 1e-5
+
+# Save only final screened active rows to results
+SAVE_ONLY_ACTIVE_CNECS = True
+
 
 def fmt_float(x):
     return str(float(x)).replace(".", "p")
@@ -163,7 +173,7 @@ def build_gmax_rd_np():
 def compute_ram_from_d2_numpy(line_f_d2_cnec: np.ndarray, line_cap_cnec: np.ndarray):
     """
     RAM formula:
-        base    = line_cap_cnec * (1 - frm)
+        base    = line_cap_cnec * (1 - FRM_VALUE)
         RAM_pos = base - line_f_d2_cnec
         RAM_neg = -base - line_f_d2_cnec
     """
@@ -202,7 +212,6 @@ def build_line_f_d2_for_fb_rows(
 
     out = np.zeros(cnec_idx_arr.shape[0], dtype=np.float64)
 
-    # Group by contingency for efficiency
     unique_k = np.unique(contingency_idx_arr)
 
     for k in unique_k:
@@ -220,6 +229,95 @@ def build_line_f_d2_for_fb_rows(
             )
 
     return out
+
+
+def subset_fb_rows(
+    *,
+    ptdf_z_cnec_all: np.ndarray,
+    cnec_all,
+    cnec_idx_all,
+    contingency_all,
+    contingency_idx_all,
+    line_f_d2_cnec_all: np.ndarray,
+    ram_pos_all: np.ndarray,
+    ram_neg_all: np.ndarray,
+    selected_idx,
+):
+    """
+    Slice all FB row-aligned arrays with the same selected index list.
+    """
+    idx = np.asarray(selected_idx, dtype=np.int64)
+
+    return {
+        "PTDF_Z_CNEC": ptdf_z_cnec_all[idx, :],
+        "CNEC": [cnec_all[i] for i in idx],
+        "CNEC_IDX": np.asarray(cnec_idx_all, dtype=np.int64)[idx],
+        "CONTINGENCY": [contingency_all[i] for i in idx],
+        "CONTINGENCY_IDX": np.asarray(contingency_idx_all, dtype=np.int64)[idx],
+        "LINE_F_D2_CNEC": np.asarray(line_f_d2_cnec_all, dtype=np.float64)[idx],
+        "RAM_POS": np.asarray(ram_pos_all, dtype=np.float64)[idx],
+        "RAM_NEG": np.asarray(ram_neg_all, dtype=np.float64)[idx],
+        "ACTIVE_IDX_IN_FULL": idx,
+    }
+
+
+def compute_constraint_flows_all(
+    ptdf_z_cnec_all: np.ndarray,
+    np_solution: np.ndarray,
+    np_d2_fb: np.ndarray,
+) -> np.ndarray:
+    """
+    Evaluate all FB constraints offline:
+        flow_j = PTDF_Z_CNEC[j,:] @ (NP - NP_D2)
+    """
+    delta_np = np.asarray(np_solution, dtype=np.float64) - np.asarray(np_d2_fb, dtype=np.float64)
+    return np.asarray(ptdf_z_cnec_all, dtype=np.float64) @ delta_np
+
+
+def find_new_violated_rows(
+    *,
+    flows_all: np.ndarray,
+    ram_pos_all: np.ndarray,
+    ram_neg_all: np.ndarray,
+    active_mask: np.ndarray,
+    viol_tol: float,
+):
+    """
+    Return omitted rows that violate either upper or lower bound.
+
+    Upper-bound violation: flow - ram_pos > viol_tol
+    Lower-bound violation: ram_neg - flow > viol_tol
+    """
+    upper_violation = flows_all - ram_pos_all
+    lower_violation = ram_neg_all - flows_all
+
+    violated_mask = (upper_violation > viol_tol) | (lower_violation > viol_tol)
+    new_mask = violated_mask & (~active_mask)
+
+    new_idx = np.where(new_mask)[0].tolist()
+
+    return new_idx, upper_violation, lower_violation
+
+
+def identify_binding_rows(
+    *,
+    flows_active: np.ndarray,
+    ram_pos_active: np.ndarray,
+    ram_neg_active: np.ndarray,
+    bind_tol: float,
+):
+    """
+    Binding row definition:
+      min(upper slack, lower slack) <= bind_tol
+    where:
+      upper slack = ram_pos - flow
+      lower slack = flow - ram_neg
+    """
+    upper_slack = ram_pos_active - flows_active
+    lower_slack = flows_active - ram_neg_active
+    binding_mask = (upper_slack <= bind_tol) | (lower_slack <= bind_tol)
+
+    return binding_mask, upper_slack, lower_slack
 
 
 ###############################################################################
@@ -393,6 +491,203 @@ def build_gsk_payload_for_t(
 
 
 ###############################################################################
+# D-1 MC SCREENING SOLVER
+###############################################################################
+
+def solve_d1_mc_with_screening(
+    *,
+    dem_np: np.ndarray,
+    renew_np: np.ndarray,
+    np_d2_fb: np.ndarray,
+    ptdf_z_cnec_all: np.ndarray,
+    cnec_all,
+    cnec_idx_all,
+    contingency_all,
+    contingency_idx_all,
+    line_f_d2_cnec_all: np.ndarray,
+    ram_pos_all: np.ndarray,
+    ram_neg_all: np.ndarray,
+    gurobi_opts: dict,
+):
+    """
+    Screening / row-generation scheme for D-1 MC.
+
+    Initial active set:
+      - all base-case rows (contingency_idx == -1)
+
+    Iteration:
+      1. solve D-1 MC with current active set
+      2. evaluate all candidate rows offline
+      3. add violated omitted rows
+      4. repeat until no omitted violations remain
+
+    Returns
+    -------
+    dict
+        Contains the final D-1 solution, final active subset, and screening log.
+    """
+    n_total = int(ptdf_z_cnec_all.shape[0])
+
+    contingency_idx_arr = np.asarray(contingency_idx_all, dtype=np.int64)
+    initial_active_idx = np.where(contingency_idx_arr == -1)[0].tolist()
+
+    if len(initial_active_idx) == 0:
+        raise RuntimeError(
+            "Screening requested but no base-case rows found. "
+            "Set INCLUDE_BASECASE_IN_N1=True or change initialization logic."
+        )
+
+    active_idx = sorted(set(initial_active_idx))
+    iteration_log = []
+
+    final_d1_mc = None
+    final_np = None
+    final_gen = None
+    final_curt = None
+    final_export = None
+    final_dual_power_balance = None
+    final_obj = None
+    final_export_pairs = None
+
+    for it in range(1, SCREENING_MAX_ITERS + 1):
+        active = subset_fb_rows(
+            ptdf_z_cnec_all=ptdf_z_cnec_all,
+            cnec_all=cnec_all,
+            cnec_idx_all=cnec_idx_all,
+            contingency_all=contingency_all,
+            contingency_idx_all=contingency_idx_all,
+            line_f_d2_cnec_all=line_f_d2_cnec_all,
+            ram_pos_all=ram_pos_all,
+            ram_neg_all=ram_neg_all,
+            selected_idx=active_idx,
+        )
+
+        d1_mc = build_d1_mc_problem_components_runtime(
+            ptdf_z_cnec_t=active["PTDF_Z_CNEC"],
+            n_constraints=len(active_idx),
+            cost_curt_mc=COST_CURT_MC,
+            max_ntc=MAX_NTC,
+            export_eps=EXPORT_EPS,
+        )
+
+        d1_mc["parameters"]["dem"].value = dem_np
+        d1_mc["parameters"]["renew"].value = renew_np
+        d1_mc["parameters"]["np_d2_fb"].value = np_d2_fb
+        d1_mc["parameters"]["ram_pos"].value = active["RAM_POS"]
+        d1_mc["parameters"]["ram_neg"].value = active["RAM_NEG"]
+
+        d1_mc["problem"].solve(solver=cp.GUROBI, ignore_dpp=True, **gurobi_opts)
+
+        if d1_mc["problem"].status not in {"optimal", "optimal_inaccurate"}:
+            raise RuntimeError(f"D-1 MC infeasible/status={d1_mc['problem'].status}")
+
+        np_sol = np.array(d1_mc["variables"]["NP"].value).reshape(-1)
+        gen_sol = np.array(d1_mc["variables"]["GEN"].value).reshape(-1)
+        curt_sol = np.array(d1_mc["variables"]["CURT"].value).reshape(-1)
+        export_sol = np.array(d1_mc["variables"]["EXPORT"].value).reshape(-1)
+        dual_power_balance = np.array(
+            [d1_mc["duals"]["power_balance"][z].dual_value for z in Z_FBMC],
+            dtype=np.float64
+        )
+
+        flows_all = compute_constraint_flows_all(
+            ptdf_z_cnec_all=ptdf_z_cnec_all,
+            np_solution=np_sol,
+            np_d2_fb=np_d2_fb,
+        )
+
+        active_mask = np.zeros(n_total, dtype=bool)
+        active_mask[np.asarray(active_idx, dtype=np.int64)] = True
+
+        new_idx, upper_violation, lower_violation = find_new_violated_rows(
+            flows_all=flows_all,
+            ram_pos_all=ram_pos_all,
+            ram_neg_all=ram_neg_all,
+            active_mask=active_mask,
+            viol_tol=SCREENING_VIOL_TOL,
+        )
+
+        max_upper_violation = float(np.max(upper_violation)) if upper_violation.size else 0.0
+        max_lower_violation = float(np.max(lower_violation)) if lower_violation.size else 0.0
+
+        iteration_log.append(
+            {
+                "iteration": it,
+                "active_before_add": int(len(active_idx)),
+                "new_added": int(len(new_idx)),
+                "active_after_add": int(len(active_idx) + len(new_idx)),
+                "max_upper_violation": max_upper_violation,
+                "max_lower_violation": max_lower_violation,
+            }
+        )
+
+        final_d1_mc = d1_mc
+        final_np = np_sol
+        final_gen = gen_sol
+        final_curt = curt_sol
+        final_export = export_sol
+        final_dual_power_balance = dual_power_balance
+        final_obj = float(d1_mc["problem"].value)
+        final_export_pairs = d1_mc["metadata"]["export_pairs"]
+
+        if len(new_idx) == 0:
+            break
+
+        active_idx = sorted(set(active_idx).union(new_idx))
+
+    if final_np is None:
+        raise RuntimeError("D-1 MC screening loop did not produce a solution.")
+
+    final_active = subset_fb_rows(
+        ptdf_z_cnec_all=ptdf_z_cnec_all,
+        cnec_all=cnec_all,
+        cnec_idx_all=cnec_idx_all,
+        contingency_all=contingency_all,
+        contingency_idx_all=contingency_idx_all,
+        line_f_d2_cnec_all=line_f_d2_cnec_all,
+        ram_pos_all=ram_pos_all,
+        ram_neg_all=ram_neg_all,
+        selected_idx=active_idx,
+    )
+
+    final_flows_active = compute_constraint_flows_all(
+        ptdf_z_cnec_all=final_active["PTDF_Z_CNEC"],
+        np_solution=final_np,
+        np_d2_fb=np_d2_fb,
+    )
+
+    binding_mask, upper_slack, lower_slack = identify_binding_rows(
+        flows_active=final_flows_active,
+        ram_pos_active=final_active["RAM_POS"],
+        ram_neg_active=final_active["RAM_NEG"],
+        bind_tol=SCREENING_BIND_TOL,
+    )
+
+    return {
+        "objective": final_obj,
+        "GEN": final_gen,
+        "CURT": final_curt,
+        "NP": final_np,
+        "EXPORT": final_export,
+        "DUAL_POWER_BALANCE": final_dual_power_balance,
+        "export_pairs": final_export_pairs,
+        "active": final_active,
+        "screening": {
+            "enabled": True,
+            "n_total_candidates": int(n_total),
+            "n_initial_active": int(len(initial_active_idx)),
+            "n_final_active": int(len(active_idx)),
+            "n_binding_final": int(np.sum(binding_mask)),
+            "iterations": iteration_log,
+            "binding_mask_final_active": binding_mask.astype(bool),
+            "upper_slack_final_active": upper_slack.astype(np.float64),
+            "lower_slack_final_active": lower_slack.astype(np.float64),
+            "flows_final_active": final_flows_active.astype(np.float64),
+        },
+    }
+
+
+###############################################################################
 # SINGLE MTU SOLVE
 ###############################################################################
 
@@ -401,17 +696,11 @@ def solve_single_mtu(t: int):
         if GLOBAL_LODF is None or GLOBAL_BAD_K is None:
             raise RuntimeError("GLOBAL_LODF / GLOBAL_BAD_K not initialized in worker.")
 
-        # ---------------------------------------------------------------------
-        # Local solver options
-        # ---------------------------------------------------------------------
         gurobi_opts = {
             "Threads": GUROBI_THREADS_PER_WORKER,
             "OutputFlag": 0,
         }
 
-        # ---------------------------------------------------------------------
-        # Build inputs
-        # ---------------------------------------------------------------------
         dem_np, renew_np = build_dem_renew_np(t)
         line_cap_np = build_line_cap_np(t)
         mc_rd_np = build_mc_rd_np()
@@ -423,14 +712,14 @@ def solve_single_mtu(t: int):
         )
 
         # ---------------------------------------------------------------------
-        # 1) D-2 CGM
+        # 1) D-2 CGM (unchanged: base-case solve only)
         # ---------------------------------------------------------------------
         objective, constraints, params_list, vars_list, _, params, vars_ = \
             build_d2_cgm_problem_components(
                 cost_curt=COST_CURT,
                 frm=float(frm),
                 max_ntc=MAX_NTC,
-                preventive=False,   # Keep your current setup
+                preventive=False,
                 LODF=None,
                 bad_k=None,
             )
@@ -456,7 +745,7 @@ def solve_single_mtu(t: int):
         export_d2 = np.array(vars_["EXPORT"].value).reshape(-1)
 
         # ---------------------------------------------------------------------
-        # 2) GSK / CNEC / PTDF_Z_CNEC
+        # 2) Build full candidate FB row pool
         # ---------------------------------------------------------------------
         gsk_payload = build_gsk_payload_for_t(
             strategy=GSK_STRATEGY,
@@ -467,67 +756,148 @@ def solve_single_mtu(t: int):
         )
 
         gsk_t = np.array(gsk_payload["gsk"], dtype=np.float64)
-        cnec_t = list(gsk_payload["cnec"])
-        cnec_idx_t = np.array(gsk_payload["cnec_idx"], dtype=np.int64)
-        ptdf_z_cnec_t = np.array(gsk_payload["ptdf_z_cnec"], dtype=np.float64)
 
-        contingency_t = list(gsk_payload["contingency"]) if "contingency" in gsk_payload else ["basecase"] * len(cnec_t)
-        contingency_idx_t = np.array(
-            gsk_payload["contingency_idx"] if "contingency_idx" in gsk_payload else [-1] * len(cnec_t),
+        cnec_all = list(gsk_payload["cnec"])
+        cnec_idx_all = np.array(gsk_payload["cnec_idx"], dtype=np.int64)
+        ptdf_z_cnec_all = np.array(gsk_payload["ptdf_z_cnec"], dtype=np.float64)
+
+        contingency_all = (
+            list(gsk_payload["contingency"])
+            if "contingency" in gsk_payload
+            else ["basecase"] * len(cnec_all)
+        )
+        contingency_idx_all = np.array(
+            gsk_payload["contingency_idx"]
+            if "contingency_idx" in gsk_payload
+            else [-1] * len(cnec_all),
             dtype=np.int64
         )
 
-        if ptdf_z_cnec_t.shape[0] != len(cnec_t):
+        if ptdf_z_cnec_all.shape[0] != len(cnec_all):
             raise ValueError("Mismatch between PTDF_Z_CNEC rows and CNEC metadata length.")
 
         # ---------------------------------------------------------------------
-        # 3) RAM from D-2 flows on selected FB rows
+        # 3) Build full candidate RAM vectors once
         # ---------------------------------------------------------------------
-        line_f_d2_cnec = build_line_f_d2_for_fb_rows(
+        line_f_d2_cnec_all = build_line_f_d2_for_fb_rows(
             line_f_d2=line_f_d2,
-            cnec_idx_t=cnec_idx_t,
-            contingency_idx_t=contingency_idx_t,
+            cnec_idx_t=cnec_idx_all,
+            contingency_idx_t=contingency_idx_all,
             lodf=GLOBAL_LODF,
         )
 
-        line_cap_cnec = line_cap_np[cnec_idx_t]
+        line_cap_cnec_all = line_cap_np[cnec_idx_all]
 
-        ram_pos, ram_neg = compute_ram_from_d2_numpy(
-            line_f_d2_cnec=line_f_d2_cnec,
-            line_cap_cnec=line_cap_cnec,
+        ram_pos_all, ram_neg_all = compute_ram_from_d2_numpy(
+            line_f_d2_cnec=line_f_d2_cnec_all,
+            line_cap_cnec=line_cap_cnec_all,
         )
 
         # ---------------------------------------------------------------------
         # 4) D-1 MC
         # ---------------------------------------------------------------------
-        d1_mc = build_d1_mc_problem_components_runtime(
-            ptdf_z_cnec_t=ptdf_z_cnec_t,
-            n_constraints=len(cnec_t),
-            cost_curt_mc=COST_CURT_MC,
-            max_ntc=MAX_NTC,
-            export_eps=EXPORT_EPS,
-        )
+        if FBMC_MODE == "n1" and SCREENING_ENABLED:
+            d1_mc_screened = solve_d1_mc_with_screening(
+                dem_np=dem_np,
+                renew_np=renew_np,
+                np_d2_fb=np_d2_fb,
+                ptdf_z_cnec_all=ptdf_z_cnec_all,
+                cnec_all=cnec_all,
+                cnec_idx_all=cnec_idx_all,
+                contingency_all=contingency_all,
+                contingency_idx_all=contingency_idx_all,
+                line_f_d2_cnec_all=line_f_d2_cnec_all,
+                ram_pos_all=ram_pos_all,
+                ram_neg_all=ram_neg_all,
+                gurobi_opts=gurobi_opts,
+            )
 
-        d1_mc["parameters"]["dem"].value = dem_np
-        d1_mc["parameters"]["renew"].value = renew_np
-        d1_mc["parameters"]["np_d2_fb"].value = np_d2_fb
-        d1_mc["parameters"]["ram_pos"].value = ram_pos
-        d1_mc["parameters"]["ram_neg"].value = ram_neg
+            obj_d1_mc = d1_mc_screened["objective"]
+            gen_d1 = d1_mc_screened["GEN"]
+            curt_d1 = d1_mc_screened["CURT"]
+            np_d1 = d1_mc_screened["NP"]
+            export_d1_mc = d1_mc_screened["EXPORT"]
+            dual_power_balance_d1_mc = d1_mc_screened["DUAL_POWER_BALANCE"]
+            export_pairs = d1_mc_screened["export_pairs"]
 
-        d1_mc["problem"].solve(solver=cp.GUROBI, ignore_dpp=True, **gurobi_opts)
-        obj_d1_mc = d1_mc["problem"].value
+            active_fb = d1_mc_screened["active"]
+            screening_info = d1_mc_screened["screening"]
 
-        if d1_mc["problem"].status not in {"optimal", "optimal_inaccurate"}:
-            raise RuntimeError(f"D-1 MC infeasible/status={d1_mc['problem'].status}")
+            # Save only final active screened rows
+            cnec_t = active_fb["CNEC"]
+            cnec_idx_t = active_fb["CNEC_IDX"]
+            contingency_t = active_fb["CONTINGENCY"]
+            contingency_idx_t = active_fb["CONTINGENCY_IDX"]
+            ptdf_z_cnec_t = active_fb["PTDF_Z_CNEC"]
+            line_f_d2_cnec = active_fb["LINE_F_D2_CNEC"]
+            ram_pos = active_fb["RAM_POS"]
+            ram_neg = active_fb["RAM_NEG"]
 
-        gen_d1 = np.array(d1_mc["variables"]["GEN"].value).reshape(-1)
-        curt_d1 = np.array(d1_mc["variables"]["CURT"].value).reshape(-1)
-        np_d1 = np.array(d1_mc["variables"]["NP"].value).reshape(-1)
-        export_d1_mc = np.array(d1_mc["variables"]["EXPORT"].value).reshape(-1)
-        dual_power_balance_d1_mc = np.array(
-            [d1_mc["duals"]["power_balance"][z].dual_value for z in Z_FBMC],
-            dtype=np.float64
-        )
+        else:
+            # Fallback: solve once with all available rows
+            d1_mc = build_d1_mc_problem_components_runtime(
+                ptdf_z_cnec_t=ptdf_z_cnec_all,
+                n_constraints=len(cnec_all),
+                cost_curt_mc=COST_CURT_MC,
+                max_ntc=MAX_NTC,
+                export_eps=EXPORT_EPS,
+            )
+
+            d1_mc["parameters"]["dem"].value = dem_np
+            d1_mc["parameters"]["renew"].value = renew_np
+            d1_mc["parameters"]["np_d2_fb"].value = np_d2_fb
+            d1_mc["parameters"]["ram_pos"].value = ram_pos_all
+            d1_mc["parameters"]["ram_neg"].value = ram_neg_all
+
+            d1_mc["problem"].solve(solver=cp.GUROBI, ignore_dpp=True, **gurobi_opts)
+            obj_d1_mc = d1_mc["problem"].value
+
+            if d1_mc["problem"].status not in {"optimal", "optimal_inaccurate"}:
+                raise RuntimeError(f"D-1 MC infeasible/status={d1_mc['problem'].status}")
+
+            gen_d1 = np.array(d1_mc["variables"]["GEN"].value).reshape(-1)
+            curt_d1 = np.array(d1_mc["variables"]["CURT"].value).reshape(-1)
+            np_d1 = np.array(d1_mc["variables"]["NP"].value).reshape(-1)
+            export_d1_mc = np.array(d1_mc["variables"]["EXPORT"].value).reshape(-1)
+            dual_power_balance_d1_mc = np.array(
+                [d1_mc["duals"]["power_balance"][z].dual_value for z in Z_FBMC],
+                dtype=np.float64
+            )
+            export_pairs = d1_mc["metadata"]["export_pairs"]
+
+            cnec_t = cnec_all
+            cnec_idx_t = cnec_idx_all
+            contingency_t = contingency_all
+            contingency_idx_t = contingency_idx_all
+            ptdf_z_cnec_t = ptdf_z_cnec_all
+            line_f_d2_cnec = line_f_d2_cnec_all
+            ram_pos = ram_pos_all
+            ram_neg = ram_neg_all
+
+            flows_final = compute_constraint_flows_all(
+                ptdf_z_cnec_all=ptdf_z_cnec_t,
+                np_solution=np_d1,
+                np_d2_fb=np_d2_fb,
+            )
+            binding_mask, upper_slack, lower_slack = identify_binding_rows(
+                flows_active=flows_final,
+                ram_pos_active=ram_pos,
+                ram_neg_active=ram_neg,
+                bind_tol=SCREENING_BIND_TOL,
+            )
+
+            screening_info = {
+                "enabled": False,
+                "n_total_candidates": int(len(cnec_all)),
+                "n_initial_active": int(len(cnec_all)),
+                "n_final_active": int(len(cnec_all)),
+                "n_binding_final": int(np.sum(binding_mask)),
+                "iterations": [],
+                "binding_mask_final_active": binding_mask.astype(bool),
+                "upper_slack_final_active": upper_slack.astype(np.float64),
+                "lower_slack_final_active": lower_slack.astype(np.float64),
+                "flows_final_active": flows_final.astype(np.float64),
+            }
 
         # ---------------------------------------------------------------------
         # 5) D-1 CGM
@@ -594,8 +964,6 @@ def solve_single_mtu(t: int):
         nod_inj_d0 = np.array(d0["variables"]["NOD_INJ"].value).reshape(-1)
         line_f_d0 = np.array(d0["variables"]["LINE_F"].value).reshape(-1)
 
-        export_pairs = d1_mc["metadata"]["export_pairs"]
-
         return {
             "t": t,
             "status": "ok",
@@ -621,13 +989,14 @@ def solve_single_mtu(t: int):
                 "MODE": FBMC_MODE,
                 "GSK": gsk_t,
                 "CNEC": cnec_t,
-                "CNEC_IDX": cnec_idx_t,
+                "CNEC_IDX": np.asarray(cnec_idx_t, dtype=np.int64),
                 "CONTINGENCY": contingency_t,
-                "CONTINGENCY_IDX": contingency_idx_t,
-                "RAM_POS": ram_pos,
-                "RAM_NEG": ram_neg,
-                "LINE_F_D2_CNEC": line_f_d2_cnec,
-                "PTDF_Z_CNEC": ptdf_z_cnec_t,
+                "CONTINGENCY_IDX": np.asarray(contingency_idx_t, dtype=np.int64),
+                "RAM_POS": np.asarray(ram_pos, dtype=np.float64),
+                "RAM_NEG": np.asarray(ram_neg, dtype=np.float64),
+                "LINE_F_D2_CNEC": np.asarray(line_f_d2_cnec, dtype=np.float64),
+                "PTDF_Z_CNEC": np.asarray(ptdf_z_cnec_t, dtype=np.float64),
+                "SCREENING": screening_info,
             },
 
             "d1_mc": {
@@ -741,24 +1110,71 @@ def save_matrix_results(results_ok, stage_dir: Path):
     line_cap_df = pd.DataFrame(
         {
             "line_cap": pd.Series(line_cap, index=L, dtype=float),
-            "line_cap_margin": pd.Series(line_cap, index=L, dtype=float) * (1.0 - float(frm)),
+            "line_cap_margin": pd.Series(line_cap, index=L, dtype=float) * (1.0 - FRM_VALUE),
         }
     )
     line_cap_df.index.name = "line"
     line_cap_df.to_parquet(fb_dir / "line_cap_margin.parquet")
 
     cnec_rows = []
+    screening_rows = []
+    screening_iter_rows = []
+    binding_rows = []
+
     for r in results_sorted:
+        screening = r["fb"]["SCREENING"]
         cnec_rows.append({
             "t": r["t"],
             "fbmc_mode": r["fb"]["MODE"],
-            "n_rows": len(r["fb"]["CNEC"]),
+            "n_rows_saved": len(r["fb"]["CNEC"]),
             "cnec": list(r["fb"]["CNEC"]),
             "cnec_idx": list(np.asarray(r["fb"]["CNEC_IDX"], dtype=int)),
             "contingency": list(r["fb"]["CONTINGENCY"]),
             "contingency_idx": list(np.asarray(r["fb"]["CONTINGENCY_IDX"], dtype=int)),
         })
+
+        screening_rows.append({
+            "t": r["t"],
+            "screening_enabled": bool(screening["enabled"]),
+            "n_total_candidates": int(screening["n_total_candidates"]),
+            "n_initial_active": int(screening["n_initial_active"]),
+            "n_final_active": int(screening["n_final_active"]),
+            "n_binding_final": int(screening["n_binding_final"]),
+            "n_iterations": int(len(screening["iterations"])),
+        })
+
+        for it_row in screening["iterations"]:
+            screening_iter_rows.append({
+                "t": r["t"],
+                **it_row,
+            })
+
+        bind_mask = np.asarray(screening["binding_mask_final_active"], dtype=bool)
+        upper_slack = np.asarray(screening["upper_slack_final_active"], dtype=np.float64)
+        lower_slack = np.asarray(screening["lower_slack_final_active"], dtype=np.float64)
+        flows_active = np.asarray(screening["flows_final_active"], dtype=np.float64)
+
+        for i in range(len(r["fb"]["CNEC"])):
+            binding_rows.append({
+                "t": r["t"],
+                "cnec": r["fb"]["CNEC"][i],
+                "cnec_idx": int(r["fb"]["CNEC_IDX"][i]),
+                "contingency": r["fb"]["CONTINGENCY"][i],
+                "contingency_idx": int(r["fb"]["CONTINGENCY_IDX"][i]),
+                "is_binding": bool(bind_mask[i]),
+                "flow_final": float(flows_active[i]),
+                "upper_slack": float(upper_slack[i]),
+                "lower_slack": float(lower_slack[i]),
+            })
+
     pd.DataFrame(cnec_rows).set_index("t").to_parquet(fb_dir / "cnec_info.parquet")
+    pd.DataFrame(screening_rows).set_index("t").to_parquet(fb_dir / "screening_summary.parquet")
+
+    if screening_iter_rows:
+        pd.DataFrame(screening_iter_rows).to_parquet(fb_dir / "screening_iterations.parquet")
+
+    if binding_rows:
+        pd.DataFrame(binding_rows).to_parquet(fb_dir / "binding_status_long.parquet")
 
     gsk_long = []
     for r in results_sorted:
@@ -937,6 +1353,7 @@ def main():
         "include_basecase_in_n1": INCLUDE_BASECASE_IN_N1,
         "include_cb_lines": INCLUDE_CB_LINES,
         "cne_alpha": CNE_ALPHA,
+        "frm": FRM_VALUE,
         "cost_curt": COST_CURT,
         "cost_curt_mc": COST_CURT_MC,
         "max_ntc": MAX_NTC,
@@ -944,7 +1361,11 @@ def main():
         "time_start": TIME_START,
         "time_end": TIME_END,
         "continue_on_error": CONTINUE_ON_ERROR,
-        "frm": FRM_VALUE,
+        "screening_enabled": SCREENING_ENABLED,
+        "screening_max_iters": SCREENING_MAX_ITERS,
+        "screening_viol_tol": SCREENING_VIOL_TOL,
+        "screening_bind_tol": SCREENING_BIND_TOL,
+        "save_only_active_cnecs": SAVE_ONLY_ACTIVE_CNECS,
     }
 
     with open(RESULTS_ROOT / "run_config.json", "w") as f:
@@ -977,7 +1398,26 @@ def main():
 
             if res["status"] == "ok":
                 results.append(res)
-                print(f"[OK] t={t}")
+
+                s = res["fb"]["SCREENING"]
+                print(
+                    f"[OK] t={t} | total={s['n_total_candidates']} "
+                    f"| init={s['n_initial_active']} "
+                    f"| final={s['n_final_active']} "
+                    f"| binding={s['n_binding_final']} "
+                    f"| iters={len(s['iterations'])}"
+                )
+
+                if s["iterations"]:
+                    for it_row in s["iterations"]:
+                        print(
+                            f"    iter={it_row['iteration']} "
+                            f"active_before={it_row['active_before_add']} "
+                            f"added={it_row['new_added']} "
+                            f"active_after={it_row['active_after_add']} "
+                            f"max_up_viol={it_row['max_upper_violation']:.6g} "
+                            f"max_low_viol={it_row['max_lower_violation']:.6g}"
+                        )
             else:
                 failures.append(res)
                 print(f"[FAIL] t={t} :: {res['error']}")
