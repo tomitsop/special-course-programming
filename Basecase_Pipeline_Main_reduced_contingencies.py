@@ -699,8 +699,8 @@ def save_matrix_results(results_ok, stage_dir: Path):
     pd.DataFrame([r["d2"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L).to_parquet(d2_dir / "line_f.parquet")
     pd.DataFrame([r["d2"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d2_dir / "delta.parquet")
     pd.DataFrame([r["d2"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d2_dir / "nod_inj.parquet")
-    export_pairs_d2 = results_sorted[0]["meta"]["export_pairs"]
-    export_cols = [f"{a}__to__{b}" for a, b in export_pairs_d2]
+    n_export = len(results_sorted[0]["d2"]["EXPORT"])
+    export_cols = [f"export_{i}" for i in range(n_export)]
     pd.DataFrame([r["d2"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=export_cols).to_parquet(d2_dir / "export.parquet")
 
     # ---- Flow-Based ----
