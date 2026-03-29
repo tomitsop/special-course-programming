@@ -122,6 +122,44 @@ def ensure_dir(path: Path):
 
 
 
+def make_parquet_safe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col]):
+            df[col] = df[col].astype(str)
+
+    if isinstance(df.index, pd.MultiIndex):
+        new_levels = []
+        for level in df.index.levels:
+            if getattr(level, "dtype", None) == object:
+                new_levels.append(level.astype(str))
+            else:
+                new_levels.append(level)
+        df.index = df.index.set_levels(new_levels)
+    elif getattr(df.index, "dtype", None) == object:
+        df.index = df.index.astype(str)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        new_levels = []
+        for level in df.columns.levels:
+            if getattr(level, "dtype", None) == object:
+                new_levels.append(level.astype(str))
+            else:
+                new_levels.append(level)
+        df.columns = df.columns.set_levels(new_levels)
+    elif getattr(df.columns, "dtype", None) == object:
+        df.columns = df.columns.astype(str)
+
+    return df
+
+
+
+def save_parquet_safe(df: pd.DataFrame, path: Path, index: bool = True):
+    make_parquet_safe(df).to_parquet(path, index=index)
+
+
+
 def build_time_index():
     X = pd.read_csv("data/X.csv", index_col=0)
     if X.index.min() == 0:
@@ -617,11 +655,11 @@ def solve_single_mtu(t: int):
                 "EXPORT": export_d2,
             },
             "fb": {
-                "MODE": FBMC_MODE,
+                "MODE": str(FBMC_MODE),
                 "GSK": gsk_t,
-                "CNEC": cnec_t,
+                "CNEC": [str(x) for x in cnec_t],
                 "CNEC_IDX": np.asarray(cnec_idx_t, dtype=np.int64),
-                "CONTINGENCY": contingency_t,
+                "CONTINGENCY": [str(x) for x in contingency_t],
                 "CONTINGENCY_IDX": np.asarray(contingency_idx_t, dtype=np.int64),
                 "RAM_POS": np.asarray(ram_pos, dtype=np.float64),
                 "RAM_NEG": np.asarray(ram_neg, dtype=np.float64),
@@ -688,26 +726,38 @@ def save_matrix_results(results_ok, stage_dir: Path):
         }
         for r in results_sorted
     ]
-    pd.DataFrame(obj_rows).set_index("t").to_parquet(stage_dir / "objectives.parquet")
+    save_parquet_safe(pd.DataFrame(obj_rows).set_index("t"), stage_dir / "objectives.parquet")
 
     # ---- D-2 ----
     d2_dir = stage_dir / "d2"
     ensure_dir(d2_dir)
-    pd.DataFrame([r["d2"]["GEN"] for r in results_sorted], index=time_sorted, columns=P).to_parquet(d2_dir / "gen.parquet")
-    pd.DataFrame([r["d2"]["CURT"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d2_dir / "curt.parquet")
-    pd.DataFrame([r["d2"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d2_dir / "np.parquet")
-    pd.DataFrame([r["d2"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L).to_parquet(d2_dir / "line_f.parquet")
-    pd.DataFrame([r["d2"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d2_dir / "delta.parquet")
-    pd.DataFrame([r["d2"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d2_dir / "nod_inj.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["GEN"] for r in results_sorted], index=time_sorted, columns=P), d2_dir / "gen.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["CURT"] for r in results_sorted], index=time_sorted, columns=N), d2_dir / "curt.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC), d2_dir / "np.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L), d2_dir / "line_f.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N), d2_dir / "delta.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N), d2_dir / "nod_inj.parquet")
     n_export = len(results_sorted[0]["d2"]["EXPORT"])
     export_cols = [f"export_{i}" for i in range(n_export)]
-    pd.DataFrame([r["d2"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=export_cols).to_parquet(d2_dir / "export.parquet")
+    save_parquet_safe(pd.DataFrame([r["d2"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=export_cols), d2_dir / "export.parquet")
 
     # ---- Flow-Based ----
     fb_dir = stage_dir / "fb"
     ensure_dir(fb_dir)
 
-    pd.DataFrame([r["fb"]["GSK"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(fb_dir / "gsk.parquet")
+    gsk_rows = []
+    for r in results_sorted:
+        gsk_mat = np.asarray(r["fb"]["GSK"], dtype=float)
+        for i, n in enumerate(N_FBMC):
+            for j, z in enumerate(Z_FBMC):
+                gsk_rows.append({
+                    "t": int(r["t"]),
+                    "node": str(n),
+                    "zone": str(z),
+                    "gsk": float(gsk_mat[i, j]),
+                })
+
+    save_parquet_safe(pd.DataFrame(gsk_rows), fb_dir / "gsk_long.parquet", index=False)
 
     fb_summary_rows = []
     ram_rows = []
@@ -730,10 +780,10 @@ def save_matrix_results(results_ok, stage_dir: Path):
 
         for i in range(mat.shape[0]):
             ram_rows.append({
-                "t": r["t"],
-                "cnec": cnec_names[i],
+                "t": int(r["t"]),
+                "cnec": str(cnec_names[i]),
                 "cnec_idx": int(cnec_idx[i]),
-                "contingency": contingency_names[i],
+                "contingency": str(contingency_names[i]),
                 "contingency_idx": int(contingency_idx[i]),
                 "line_f_d2_cnec": float(line_f_d2_cnec[i]),
                 "ram_pos": float(ram_pos[i]),
@@ -741,48 +791,48 @@ def save_matrix_results(results_ok, stage_dir: Path):
             })
             for j, z in enumerate(Z_FBMC):
                 ptdf_rows.append({
-                    "t": r["t"],
-                    "cnec": cnec_names[i],
+                    "t": int(r["t"]),
+                    "cnec": str(cnec_names[i]),
                     "cnec_idx": int(cnec_idx[i]),
-                    "contingency": contingency_names[i],
+                    "contingency": str(contingency_names[i]),
                     "contingency_idx": int(contingency_idx[i]),
-                    "zone": z,
+                    "zone": str(z),
                     "ptdf": float(mat[i, j]),
                 })
 
-    pd.DataFrame(fb_summary_rows).set_index("t").to_parquet(fb_dir / "fb_summary.parquet")
-    pd.DataFrame(ram_rows).to_parquet(fb_dir / "ram_long.parquet", index=False)
-    pd.DataFrame(ptdf_rows).to_parquet(fb_dir / "ptdf_z_cnec_long.parquet", index=False)
+    save_parquet_safe(pd.DataFrame(fb_summary_rows).set_index("t"), fb_dir / "fb_summary.parquet")
+    save_parquet_safe(pd.DataFrame(ram_rows), fb_dir / "ram_long.parquet", index=False)
+    save_parquet_safe(pd.DataFrame(ptdf_rows), fb_dir / "ptdf_z_cnec_long.parquet", index=False)
 
     # ---- D-1 MC ----
     d1_mc_dir = stage_dir / "d1_mc"
     ensure_dir(d1_mc_dir)
-    pd.DataFrame([r["d1_mc"]["GEN"] for r in results_sorted], index=time_sorted, columns=P).to_parquet(d1_mc_dir / "gen.parquet")
-    pd.DataFrame([r["d1_mc"]["CURT"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d1_mc_dir / "curt.parquet")
-    pd.DataFrame([r["d1_mc"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d1_mc_dir / "np.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_mc"]["GEN"] for r in results_sorted], index=time_sorted, columns=P), d1_mc_dir / "gen.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_mc"]["CURT"] for r in results_sorted], index=time_sorted, columns=N), d1_mc_dir / "curt.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_mc"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC), d1_mc_dir / "np.parquet")
     d1mc_export_cols = [f"export_{i}" for i in range(len(results_sorted[0]["d1_mc"]["EXPORT"]))]
-    pd.DataFrame([r["d1_mc"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=d1mc_export_cols).to_parquet(d1_mc_dir / "export.parquet")
-    pd.DataFrame([r["d1_mc"]["DUAL_POWER_BALANCE"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d1_mc_dir / "dual_power_balance.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_mc"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=d1mc_export_cols), d1_mc_dir / "export.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_mc"]["DUAL_POWER_BALANCE"] for r in results_sorted], index=time_sorted, columns=Z_FBMC), d1_mc_dir / "dual_power_balance.parquet")
 
     # ---- D-1 CGM ----
     d1_cgm_dir = stage_dir / "d1_cgm"
     ensure_dir(d1_cgm_dir)
-    pd.DataFrame([r["d1_cgm"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d1_cgm_dir / "delta.parquet")
-    pd.DataFrame([r["d1_cgm"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d1_cgm_dir / "nod_inj.parquet")
-    pd.DataFrame([r["d1_cgm"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L).to_parquet(d1_cgm_dir / "line_f.parquet")
-    pd.DataFrame([r["d1_cgm"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d1_cgm_dir / "np.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_cgm"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N), d1_cgm_dir / "delta.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_cgm"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N), d1_cgm_dir / "nod_inj.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_cgm"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L), d1_cgm_dir / "line_f.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_cgm"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC), d1_cgm_dir / "np.parquet")
     d1cgm_export_cols = [f"export_{i}" for i in range(len(results_sorted[0]["d1_cgm"]["EXPORT"]))]
-    pd.DataFrame([r["d1_cgm"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=d1cgm_export_cols).to_parquet(d1_cgm_dir / "export.parquet")
+    save_parquet_safe(pd.DataFrame([r["d1_cgm"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=d1cgm_export_cols), d1_cgm_dir / "export.parquet")
 
     # ---- D-0 ----
     d0_dir = stage_dir / "d0"
     ensure_dir(d0_dir)
-    pd.DataFrame([r["d0"]["CURT_RD"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d0_dir / "curt_rd.parquet")
-    pd.DataFrame([r["d0"]["RD_POS"] for r in results_sorted], index=time_sorted, columns=P_RD).to_parquet(d0_dir / "rd_pos.parquet")
-    pd.DataFrame([r["d0"]["RD_NEG"] for r in results_sorted], index=time_sorted, columns=P_RD).to_parquet(d0_dir / "rd_neg.parquet")
-    pd.DataFrame([r["d0"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d0_dir / "delta.parquet")
-    pd.DataFrame([r["d0"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d0_dir / "nod_inj.parquet")
-    pd.DataFrame([r["d0"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L).to_parquet(d0_dir / "line_f.parquet")
+    save_parquet_safe(pd.DataFrame([r["d0"]["CURT_RD"] for r in results_sorted], index=time_sorted, columns=N), d0_dir / "curt_rd.parquet")
+    save_parquet_safe(pd.DataFrame([r["d0"]["RD_POS"] for r in results_sorted], index=time_sorted, columns=P_RD), d0_dir / "rd_pos.parquet")
+    save_parquet_safe(pd.DataFrame([r["d0"]["RD_NEG"] for r in results_sorted], index=time_sorted, columns=P_RD), d0_dir / "rd_neg.parquet")
+    save_parquet_safe(pd.DataFrame([r["d0"]["DELTA"] for r in results_sorted], index=time_sorted, columns=N), d0_dir / "delta.parquet")
+    save_parquet_safe(pd.DataFrame([r["d0"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N), d0_dir / "nod_inj.parquet")
+    save_parquet_safe(pd.DataFrame([r["d0"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L), d0_dir / "line_f.parquet")
 
 
 ###############################################################################
