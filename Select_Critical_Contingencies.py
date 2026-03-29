@@ -22,7 +22,7 @@ from Basecase_Dynamic_GSK_Definition_pipeline import (
 # CONFIG
 ###############################################################################
 
-N_WORKERS = 10
+N_WORKERS = 12
 GUROBI_THREADS_PER_WORKER = 1
 
 # GSK strategy used for the offline contingency-selection study.
@@ -31,7 +31,7 @@ GUROBI_THREADS_PER_WORKER = 1
 GSK_STRATEGY = "pmax_sub"
 
 # Adjust line capacities for contingency selection to avod infeasibilities
-df_branch["Pmax"] = 0.65 * df_branch["Pmax"]
+df_branch["Pmax"] = 0.85 * df_branch["Pmax"]
 
 # Must stay in N-1 mode for contingency selection.
 FBMC_MODE = "n1"
