@@ -760,7 +760,8 @@ def save_matrix_results(results_ok, stage_dir: Path):
     pd.DataFrame([r["d1_mc"]["GEN"] for r in results_sorted], index=time_sorted, columns=P).to_parquet(d1_mc_dir / "gen.parquet")
     pd.DataFrame([r["d1_mc"]["CURT"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d1_mc_dir / "curt.parquet")
     pd.DataFrame([r["d1_mc"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d1_mc_dir / "np.parquet")
-    pd.DataFrame([r["d1_mc"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=export_cols).to_parquet(d1_mc_dir / "export.parquet")
+    d1mc_export_cols = [f"export_{i}" for i in range(len(results_sorted[0]["d1_mc"]["EXPORT"]))]
+    pd.DataFrame([r["d1_mc"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=d1mc_export_cols).to_parquet(d1_mc_dir / "export.parquet")
     pd.DataFrame([r["d1_mc"]["DUAL_POWER_BALANCE"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d1_mc_dir / "dual_power_balance.parquet")
 
     # ---- D-1 CGM ----
@@ -770,7 +771,8 @@ def save_matrix_results(results_ok, stage_dir: Path):
     pd.DataFrame([r["d1_cgm"]["NOD_INJ"] for r in results_sorted], index=time_sorted, columns=N).to_parquet(d1_cgm_dir / "nod_inj.parquet")
     pd.DataFrame([r["d1_cgm"]["LINE_F"] for r in results_sorted], index=time_sorted, columns=L).to_parquet(d1_cgm_dir / "line_f.parquet")
     pd.DataFrame([r["d1_cgm"]["NP"] for r in results_sorted], index=time_sorted, columns=Z_FBMC).to_parquet(d1_cgm_dir / "np.parquet")
-    pd.DataFrame([r["d1_cgm"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=export_cols).to_parquet(d1_cgm_dir / "export.parquet")
+    d1cgm_export_cols = [f"export_{i}" for i in range(len(results_sorted[0]["d1_cgm"]["EXPORT"]))]
+    pd.DataFrame([r["d1_cgm"]["EXPORT"] for r in results_sorted], index=time_sorted, columns=d1cgm_export_cols).to_parquet(d1_cgm_dir / "export.parquet")
 
     # ---- D-0 ----
     d0_dir = stage_dir / "d0"
