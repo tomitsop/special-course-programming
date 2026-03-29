@@ -367,6 +367,7 @@ def build_gsk_payload_for_t(
     gen_d2_np: np.ndarray,
     lodf: np.ndarray,
     bad_k: np.ndarray,
+    selected_contingencies=None,
 ):
     gen_d2_series = pd.Series(gen_d2_np, index=P)
     return gsk_manager.build_for_t(
@@ -376,6 +377,7 @@ def build_gsk_payload_for_t(
         bad_k=bad_k,
         fbmc_mode=FBMC_MODE,
         include_basecase=INCLUDE_BASECASE_IN_N1,
+        selected_contingencies=selected_contingencies,
     )
 
 
@@ -443,6 +445,7 @@ def solve_single_mtu(t: int):
             gen_d2_np=gen_d2,
             lodf=GLOBAL_LODF,
             bad_k=GLOBAL_BAD_K,
+            selected_contingencies=GLOBAL_SELECTED_CONTINGENCIES,
         )
 
         gsk_t = np.array(gsk_payload["gsk"], dtype=np.float64)

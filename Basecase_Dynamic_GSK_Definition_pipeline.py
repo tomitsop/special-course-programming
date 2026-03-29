@@ -42,16 +42,6 @@ def _build_pairwise_z2z_matrix(ptdf_z: np.ndarray) -> np.ndarray:
     """
     Build all pairwise zonal PTDF differences:
         PTDF_Z[:, i] - PTDF_Z[:, j] for i < j
-
-    Parameters
-    ----------
-    ptdf_z : np.ndarray
-        Shape (n_lines, n_zones)
-
-    Returns
-    -------
-    np.ndarray
-        Shape (n_lines, n_pairs)
     """
     n_z = ptdf_z.shape[1]
     n_pairs = int(n_z * (n_z - 1) / 2)
@@ -163,6 +153,48 @@ def _select_monitored_line_indices_from_ptdf_z(
     return selected_idx
 
 
+def _normalize_selected_contingencies(selected_contingencies=None) -> np.ndarray | None:
+    """
+    Normalize selected contingencies to a unique integer array or None.
+
+    Notes
+    -----
+    - Removes -1 if present, since -1 corresponds to the optional base-case block.
+    - Preserves sorted unique indices.
+    """
+    if selected_contingencies is None:
+        return None
+
+    selected = np.asarray(selected_contingencies, dtype=np.int64).reshape(-1)
+    if selected.size == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    if np.any((selected < -1) | (selected >= len(L))):
+        bad_vals = selected[(selected < -1) | (selected >= len(L))]
+        raise ValueError(
+            f"selected_contingencies contains out-of-range values: {bad_vals.tolist()}"
+        )
+
+    selected = selected[selected != -1]
+    return np.unique(selected)
+
+
+def _build_contingency_iterator(selected_contingencies=None, bad_k=None) -> list:
+    """
+    Return the valid contingency indices to build in the N-1 block.
+
+    If selected_contingencies is None, iterate over all non-bad contingencies.
+    Otherwise, iterate only over the selected non-bad contingencies.
+    """
+    bad_mask = _build_bad_k_mask(bad_k)
+    selected = _normalize_selected_contingencies(selected_contingencies)
+
+    if selected is None:
+        return [k for k in range(len(L)) if not bad_mask[k]]
+
+    return [int(k) for k in selected if not bad_mask[int(k)]]
+
+
 def build_post_contingency_zonal_ptdf_block(
     ptdf_z_base: np.ndarray,
     lodf: np.ndarray,
@@ -172,28 +204,12 @@ def build_post_contingency_zonal_ptdf_block(
     Efficient N-1 zonal PTDF update:
 
         PTDF_Z^(k) = PTDF_Z + LODF[:, k] outer PTDF_Z[k, :]
-
-    Parameters
-    ----------
-    ptdf_z_base : np.ndarray
-        Base zonal PTDF matrix of shape (|L|, |Z_FBMC|)
-
-    lodf : np.ndarray
-        LODF matrix of shape (|L|, |L|)
-
-    contingency_idx : int
-        Outaged line index k
-
-    Returns
-    -------
-    np.ndarray
-        Post-contingency zonal PTDF block of shape (|L|, |Z_FBMC|)
     """
     if contingency_idx < 0 or contingency_idx >= len(L):
         raise IndexError(f"contingency_idx {contingency_idx} out of range.")
 
-    lodf_col = lodf[:, contingency_idx].reshape(-1, 1)       # (L, 1)
-    outage_row = ptdf_z_base[contingency_idx, :].reshape(1, -1)  # (1, Z)
+    lodf_col = lodf[:, contingency_idx].reshape(-1, 1)
+    outage_row = ptdf_z_base[contingency_idx, :].reshape(1, -1)
 
     return ptdf_z_base + (lodf_col @ outage_row)
 
@@ -207,22 +223,6 @@ def compute_post_contingency_line_flows(
     Efficient N-1 line flow update:
 
         f^(k) = f + LODF[:, k] * f[k]
-
-    Parameters
-    ----------
-    line_f_base : np.ndarray
-        Base line flow vector of shape (|L|,)
-
-    lodf : np.ndarray
-        LODF matrix of shape (|L|, |L|)
-
-    contingency_idx : int
-        Outaged line index k
-
-    Returns
-    -------
-    np.ndarray
-        Post-contingency line flow vector of shape (|L|,)
     """
     f = np.asarray(line_f_base, dtype=float).reshape(-1)
     lodf_arr = _validate_lodf(lodf)
@@ -257,15 +257,9 @@ def compute_selected_post_contingency_line_flows(
 
 ###############################################################
 # Static GSK builders
-# These are written to match input_data_base_functions.py logic
 ###############################################################
 
 def build_flat_gsk():
-    """
-    Flat GSK:
-    each FBMC node in a zone gets 1 / (#nodes_in_zone) for that zone,
-    matching get_gsk_flat() in input_data_base_functions.py.
-    """
     gsk = np.zeros((len(N_FBMC), len(Z_FBMC)), dtype=float)
 
     for n in N_FBMC:
@@ -287,11 +281,6 @@ def build_flat_gsk():
 
 
 def build_flat_unit_gsk():
-    """
-    Flat unit GSK:
-    equal weight for conventional nodes in each zone,
-    matching get_gsk_flat_unit() in input_data_base_functions.py.
-    """
     gsk = np.zeros((len(N_FBMC), len(Z_FBMC)), dtype=float)
 
     for n in N_FBMC:
@@ -315,10 +304,6 @@ def build_flat_unit_gsk():
 
 
 def build_pmax_gsk():
-    """
-    Pmax-based GSK over conventional generators P,
-    matching get_gsk_pmax() in input_data_base_functions.py.
-    """
     gsk = np.zeros((len(N_FBMC), len(Z_FBMC)), dtype=float)
 
     for n in N_FBMC:
@@ -361,11 +346,6 @@ def build_pmax_gsk():
 
 
 def build_pmax_sub_gsk():
-    """
-    Pmax-based GSK on a subset of generators
-    (Hard Coal, Gas/CCGT in FB zones),
-    matching get_gsk_pmax_sub() in input_data_base_functions.py.
-    """
     p_sub = df_plants.loc[
         (df_plants["Type"].isin(["Hard Coal", "Gas/CCGT"])) &
         (df_plants["Zone"].isin(Z_FBMC)),
@@ -419,11 +399,6 @@ def build_pmax_sub_gsk():
 ###############################################################
 
 def build_dynamic_headroom_gsk(d2_gen_t: pd.Series):
-    """
-    Dynamic headroom GSK:
-    zone weights proportional to available headroom (Pmax - dispatched gen)
-    over conventional plants in the FBMC zone.
-    """
     gsk = np.zeros((len(N_FBMC), len(Z_FBMC)), dtype=float)
 
     for z in Z_FBMC:
@@ -460,11 +435,6 @@ def build_dynamic_headroom_gsk(d2_gen_t: pd.Series):
 
 
 def build_dynamic_gen_gsk(d2_gen_t: pd.Series):
-    """
-    Dynamic generation GSK:
-    zone weights proportional to actual D-2 generation over conventional plants
-    in the FBMC zone.
-    """
     gsk = np.zeros((len(N_FBMC), len(Z_FBMC)), dtype=float)
 
     for z in Z_FBMC:
@@ -511,11 +481,6 @@ def compute_cnec_from_gsk(gsk, cne_alpha, include_cb_lines=True):
       - CNEC set selected by max abs z-z >= cne_alpha
       - optionally add cross-border lines
       - preserve L ordering in final CNEC list
-
-    Returns
-    -------
-    tuple
-        (cnec, cnec_idx, ptdf_z, ptdf_z_cnec)
     """
     gsk_arr = _validate_gsk(gsk)
     ptdf_z = PTDF_FBMC @ gsk_arr
@@ -543,6 +508,7 @@ def compute_cnec_from_gsk_n1(
     cne_alpha=0.05,
     include_cb_lines=True,
     include_basecase=True,
+    selected_contingencies=None,
 ):
     """
     Contingency-aware (N-1) computation using direct zonal PTDF updates.
@@ -558,41 +524,18 @@ def compute_cnec_from_gsk_n1(
 
     Parameters
     ----------
-    gsk : array-like
-        Shape (|N_FBMC|, |Z_FBMC|)
-
-    lodf : array-like
-        Shape (|L|, |L|)
-
-    bad_k : array-like of bool, optional
-        Length |L|. True means skip this contingency.
-
-    cne_alpha : float
-        CNE/CNEC threshold.
-
-    include_cb_lines : bool
-        If True, always include cross-border monitored lines in each block.
-
-    include_basecase : bool
-        If True, prepend base-case (N-0) selected rows with contingency_idx = -1.
-
-    Returns
-    -------
-    dict
-        Keys:
-          - gsk
-          - ptdf_z
-          - ptdf_z_cnec
-          - cnec
-          - cnec_idx
-          - contingency
-          - contingency_idx
-          - cnec_meta
-          - n_rows
+    selected_contingencies : array-like of int, optional
+        If provided, only these contingency indices are built in the N-1 block.
+        The optional base-case block is still controlled separately by
+        include_basecase.
     """
     gsk_arr = _validate_gsk(gsk)
     lodf_arr = _validate_lodf(lodf)
     bad_mask = _build_bad_k_mask(bad_k)
+    contingency_iter = _build_contingency_iterator(
+        selected_contingencies=selected_contingencies,
+        bad_k=bad_mask,
+    )
 
     ptdf_z_base = PTDF_FBMC @ gsk_arr
 
@@ -603,7 +546,6 @@ def compute_cnec_from_gsk_n1(
     contingency_idx = []
     meta = []
 
-    # Optional N-0 block first
     if include_basecase:
         selected_idx_base = _select_monitored_line_indices_from_ptdf_z(
             ptdf_z=ptdf_z_base,
@@ -626,8 +568,7 @@ def compute_cnec_from_gsk_n1(
                 }
             )
 
-    # N-1 blocks
-    for k in range(len(L)):
+    for k in contingency_iter:
         if bad_mask[k]:
             continue
 
@@ -687,9 +628,6 @@ class GSKStrategyManager:
         self.static_cache = {}
 
     def _build_gsk_only(self, strategy, t=None, df_d2_gen=None):
-        """
-        Build only the GSK for the requested strategy.
-        """
         if strategy == "flat":
             return build_flat_gsk()
 
@@ -732,60 +670,13 @@ class GSKStrategyManager:
         bad_k=None,
         fbmc_mode="basecase",
         include_basecase=True,
+        selected_contingencies=None,
     ):
         """
         Build the GSK payload for one MTU.
 
-        Parameters
-        ----------
-        strategy : str
-            One of:
-              - flat
-              - flat_unit
-              - pmax
-              - pmax_sub
-              - dynamic_headroom
-              - dynamic_gen
-
-        t : optional
-            Time index when using a full DataFrame for dynamic GSKs.
-
-        df_d2_gen : DataFrame or Series, optional
-            D-2 generation data for dynamic GSK strategies.
-
-        lodf : np.ndarray, optional
-            Required when fbmc_mode == "n1".
-
-        bad_k : array-like of bool, optional
-            Contingencies to skip when fbmc_mode == "n1".
-
-        fbmc_mode : str
-            "basecase" or "n1"
-
-        include_basecase : bool
-            Only used when fbmc_mode == "n1".
-            If True, prepend N-0 rows before N-1 rows.
-
-        Returns
-        -------
-        dict
-            Base-case mode keys:
-              - gsk
-              - cnec
-              - cnec_idx
-              - ptdf_z
-              - ptdf_z_cnec
-
-            N-1 mode keys:
-              - gsk
-              - cnec
-              - cnec_idx
-              - contingency
-              - contingency_idx
-              - cnec_meta
-              - ptdf_z
-              - ptdf_z_cnec
-              - n_rows
+        If selected_contingencies is provided in N-1 mode, only the base-case
+        block and those contingency blocks are constructed.
         """
         mode = str(fbmc_mode).lower().strip()
         if mode not in {"basecase", "n1"}:
@@ -793,9 +684,12 @@ class GSKStrategyManager:
 
         is_static = strategy in {"flat", "flat_unit", "pmax", "pmax_sub"}
 
+        selected_contingencies_arr = _normalize_selected_contingencies(selected_contingencies)
+
         cache_key = None
         if is_static:
             bad_mask = _build_bad_k_mask(bad_k) if mode == "n1" else np.zeros(len(L), dtype=bool)
+            selected_key = None if selected_contingencies_arr is None else tuple(selected_contingencies_arr.tolist())
             cache_key = (
                 strategy,
                 mode,
@@ -803,6 +697,7 @@ class GSKStrategyManager:
                 bool(self.include_cb_lines),
                 float(self.cne_alpha),
                 bad_mask.tobytes(),
+                selected_key,
             )
             if cache_key in self.static_cache:
                 return self.static_cache[cache_key]
@@ -834,6 +729,7 @@ class GSKStrategyManager:
                 cne_alpha=self.cne_alpha,
                 include_cb_lines=self.include_cb_lines,
                 include_basecase=include_basecase,
+                selected_contingencies=selected_contingencies_arr,
             )
 
         if cache_key is not None:
